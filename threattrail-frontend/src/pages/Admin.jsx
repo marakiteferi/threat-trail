@@ -142,44 +142,36 @@ export default function Admin() {
     setCreateSuccessData(null)
 
     try {
-      // Step 1: Create Scenario
-      setSubmitStep('Step 1/4: Registering attack scenario...')
-      const scRes = await api.post('/admin/scenarios', {
+      // Step 1: Create Scenario, Alert, and Questions in a single atomic transaction
+      setSubmitStep('Step 1/2: Registering scenario, alert, and questions atomically...')
+
+      const questionsPayload = createQuestions
+        .filter(q => q.q && q.a)
+        .map(q => ({
+          question_text: q.q.trim(),
+          correct_answer: q.a.trim(),
+          points: parseInt(q.points) || 10,
+        }))
+
+      const totalPts = questionsPayload.reduce((sum, q) => sum + (q.points || 10), 0)
+
+      const fullRes = await api.post('/admin/scenarios/full', {
         name: createName,
         description: createDesc,
         mitre_technique: createMitre,
         status: createStatus,
-      })
-      const scId = scRes.data.id
-
-      // Step 2: Create Alert
-      setSubmitStep('Step 2/4: Configuring detection alert...')
-      await api.post(`/admin/scenarios/${scId}/alert`, {
-        title: createAlertTitle || `Detection Alert: ${createName}`,
-        severity: createAlertSeverity,
+        alert_title: createAlertTitle || `Detection Alert: ${createName}`,
+        alert_severity: createAlertSeverity,
+        questions: questionsPayload,
       })
 
-      // Step 3: Add Questions
-      setSubmitStep('Step 3/4: Creating investigation questions with point values...')
-      let questionsAdded = 0
-      let totalPts = 0
-      for (const q of createQuestions) {
-        if (q.q && q.a) {
-          const pts = parseInt(q.points) || 10
-          await api.post(`/admin/scenarios/${scId}/questions`, {
-            question_text: q.q,
-            correct_answer: q.a,
-            points: pts,
-          })
-          questionsAdded++
-          totalPts += pts
-        }
-      }
+      const scId = fullRes.data.id
+      const questionsAdded = fullRes.data.questions?.length || questionsPayload.length
 
-      // Step 4: Upload Logs if ZIP selected
+      // Step 2: Upload Logs if ZIP archive selected
       let logsInserted = 0
       if (createFile) {
-        setSubmitStep('Step 4/4: Uploading and ingesting Windows Event logs archive...')
+        setSubmitStep('Step 2/2: Uploading and ingesting Windows Event logs archive...')
         const formData = new FormData()
         formData.append('file', createFile)
 
@@ -201,7 +193,7 @@ export default function Admin() {
         logsCount: logsInserted,
       })
 
-      showToast(`Scenario "${createName}" (${totalPts} pts) created successfully!`)
+      showToast(`Scenario "${createName}" (${totalPts} pts) created successfully in atomic transaction!`)
 
       // Reset form fields
       setCreateName('')

@@ -3,11 +3,16 @@ from sqlalchemy import text
 import bcrypt
 
 def migrate():
-    with engine.connect() as conn:
-        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user';"))
-        conn.execute(text("SELECT setval(pg_get_serial_sequence('users', 'id'), coalesce(max(id), 1)) FROM users;"))
-        conn.commit()
-    print("[+] DB migration: 'role' column confirmed & sequence synced.")
+    from models import Base
+    Base.metadata.create_all(bind=engine)
+    if engine.dialect.name == "postgresql":
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'user';"))
+            conn.execute(text("SELECT setval(pg_get_serial_sequence('users', 'id'), coalesce(max(id), 1)) FROM users;"))
+            conn.commit()
+        print("[+] DB migration: 'role' column confirmed & sequence synced.")
+    else:
+        print("[+] DB migration: tables and schema verified for " + engine.dialect.name)
 
     db = SessionLocal()
     try:

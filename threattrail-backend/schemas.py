@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any, Optional
 from datetime import datetime
 
@@ -11,6 +11,7 @@ class ScenarioOut(BaseModel):
     description: str
     mitre_technique: str
     status: str = "Draft"
+    ad_context: Optional[dict[str, Any]] = None
 
     model_config = {"from_attributes": True}
 
@@ -22,6 +23,7 @@ class AlertOut(BaseModel):
     scenario_id: int
     title: str
     severity: str
+    sigma_rule: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -48,7 +50,7 @@ class QuestionOut(BaseModel):
     scenario_id: int
     question_text: str
     points: int = 10
-    # NOTE: correct_answer is intentionally excluded — never sent to regular trainees
+    # correct_answer & acceptable_answers excluded for trainees
 
     model_config = {"from_attributes": True}
 
@@ -58,6 +60,8 @@ class QuestionAdminOut(BaseModel):
     scenario_id: int
     question_text: str
     correct_answer: str
+    acceptable_answers: Optional[list[str]] = Field(default_factory=list)
+    explanation: Optional[str] = None
     points: int = 10
 
     model_config = {"from_attributes": True}
@@ -66,14 +70,13 @@ class QuestionAdminOut(BaseModel):
 # ── Submission (request body) ─────────────────────────────────────────────────
 
 class AnswerSubmission(BaseModel):
-    """One answer from the user: question_id → their answer string."""
     question_id: int
     answer: str
 
 
 class SubmissionRequest(BaseModel):
-    """POST body for /api/scenarios/{id}/submit"""
     answers: list[AnswerSubmission]
+    pinned_log_ids: Optional[list[int]] = Field(default_factory=list)
 
 
 # ── Grading result (response) ─────────────────────────────────────────────────
@@ -83,6 +86,7 @@ class QuestionResult(BaseModel):
     question_text: str
     user_answer: str
     correct_answer: str
+    explanation: Optional[str] = None
     is_correct: bool
     points_awarded: int = 0
     points_possible: int = 10
@@ -95,6 +99,8 @@ class SubmissionResponse(BaseModel):
     total_points: int = 0
     points_earned: int = 0
     score_percent: int
+    pinned_log_ids: list[int] = Field(default_factory=list)
+    key_evidence_log_ids: list[int] = Field(default_factory=list)
     results: list[QuestionResult]
 
 
@@ -105,6 +111,7 @@ class ScenarioCreate(BaseModel):
     description: str
     mitre_technique: str
     status: Optional[str] = "Published"
+    ad_context: Optional[dict[str, Any]] = None
 
 
 class ScenarioUpdate(BaseModel):
@@ -112,6 +119,7 @@ class ScenarioUpdate(BaseModel):
     description: Optional[str] = None
     mitre_technique: Optional[str] = None
     status: Optional[str] = None
+    ad_context: Optional[dict[str, Any]] = None
 
 
 class StatusUpdate(BaseModel):
@@ -121,11 +129,14 @@ class StatusUpdate(BaseModel):
 class AlertCreate(BaseModel):
     title: str
     severity: str
+    sigma_rule: Optional[str] = None
 
 
 class QuestionCreate(BaseModel):
     question_text: str
     correct_answer: str
+    acceptable_answers: Optional[list[str]] = Field(default_factory=list)
+    explanation: Optional[str] = None
     points: int = 10
 
 
@@ -135,6 +146,7 @@ class ScenarioAdminOut(BaseModel):
     description: str
     mitre_technique: str
     status: str
+    ad_context: Optional[dict[str, Any]] = None
     alert: Optional[AlertOut] = None
     logs_count: int = 0
     questions_count: int = 0
@@ -148,11 +160,24 @@ class ScenarioAdminDetailOut(BaseModel):
     description: str
     mitre_technique: str
     status: str
+    ad_context: Optional[dict[str, Any]] = None
     alert: Optional[AlertOut] = None
-    questions: list[QuestionAdminOut] = []
+    questions: list[QuestionAdminOut] = Field(default_factory=list)
     logs_count: int = 0
 
     model_config = {"from_attributes": True}
+
+
+class ScenarioFullCreate(BaseModel):
+    name: str
+    description: str
+    mitre_technique: str
+    status: Optional[str] = "Published"
+    ad_context: Optional[dict[str, Any]] = None
+    alert_title: Optional[str] = None
+    alert_severity: Optional[str] = "High"
+    sigma_rule: Optional[str] = None
+    questions: Optional[list[QuestionCreate]] = Field(default_factory=list)
 
 
 class ScenarioFullUpdate(BaseModel):
@@ -160,8 +185,10 @@ class ScenarioFullUpdate(BaseModel):
     description: Optional[str] = None
     mitre_technique: Optional[str] = None
     status: Optional[str] = None
+    ad_context: Optional[dict[str, Any]] = None
     alert_title: Optional[str] = None
     alert_severity: Optional[str] = None
+    sigma_rule: Optional[str] = None
     questions: Optional[list[QuestionCreate]] = None
 
 
