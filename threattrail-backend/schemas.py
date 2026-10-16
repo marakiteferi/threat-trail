@@ -38,6 +38,7 @@ class LogOut(BaseModel):
     source_ip: Optional[str] = None
     username: Optional[str] = None
     target_host: Optional[str] = None
+    is_key_evidence: bool = False
     raw_event_data: dict[str, Any]
 
     model_config = {"from_attributes": True}

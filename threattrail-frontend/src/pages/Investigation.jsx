@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react'
+import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import api from '../api'
 import LogInspector from '../components/LogInspector'
@@ -14,7 +14,11 @@ import {
   ChevronDown,
   ChevronRight,
   Send,
-  Filter
+  Filter,
+  Zap,
+  X,
+  Eye,
+  EyeOff,
 } from 'lucide-react'
 
 const EVENT_CHEAT_SHEET = [
@@ -29,6 +33,29 @@ const EVENT_CHEAT_SHEET = [
   { id: 10, title: 'Sysmon: ProcessAccess', desc: 'Process opened another process (e.g., Mimikatz accessing lsass.exe).' },
 ]
 
+/** Detect likely external / attacker IPs: any IP that doesn't match common internal RFC-1918 ranges */
+function classifyIPs(logs) {
+  const internal = /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)/
+  const byIp = {}
+  for (const log of logs) {
+    const ip = log.source_ip
+    if (!ip || internal.test(ip)) continue
+    byIp[ip] = (byIp[ip] || 0) + 1
+  }
+  // Also detect IPs that appear in bursts of failures (even if internal)
+  const failures = {}
+  for (const log of logs) {
+    if (!log.source_ip) continue
+    if (log.event_id === 4625 || log.event_id === 4771) {
+      failures[log.source_ip] = (failures[log.source_ip] || 0) + 1
+    }
+  }
+  for (const [ip, cnt] of Object.entries(failures)) {
+    if (cnt >= 5 && !byIp[ip]) byIp[ip] = cnt
+  }
+  return byIp // { ip: count }
+}
+
 export default function Investigation() {
   const { scenarioId } = useParams()
   const navigate = useNavigate()
@@ -40,10 +67,18 @@ export default function Investigation() {
   const [answers, setAnswers] = useState({})
   const [pinnedLogIds, setPinnedLogIds] = useState([])
 
-  // UI Toggles & Filters
+  // ── UI Toggles & Filters ──────────────────────────────────────────────────
   const [searchTerm, setSearchTerm] = useState('')
-  const [selectedEventId, setSelectedEventId] = useState('ALL')
-  const [activeLeftTab, setActiveLeftTab] = useState('logs') // 'logs' | 'timeline' | 'ad_context' | 'cheatsheet'
+  // Multi-select: array of event ID strings. Empty = ALL
+  const [selectedEventIds, setSelectedEventIds] = useState([])
+  // Attacker-IP quick filter (single selection)
+  const [selectedAttackerIp, setSelectedAttackerIp] = useState('')
+  // Key-evidence-only toggle
+  const [keyEvidenceOnly, setKeyEvidenceOnly] = useState(false)
+  // Time-range filter: indices into sorted log array
+  const [timeRangeIdx, setTimeRangeIdx] = useState([0, 100]) // [startPct, endPct] as percentage 0–100
+
+  const [activeLeftTab, setActiveLeftTab] = useState('logs')
   const [showSigmaModal, setShowSigmaModal] = useState(false)
   const [expandedLogId, setExpandedLogId] = useState(null)
   const [currentPage, setCurrentPage] = useState(1)
@@ -79,12 +114,12 @@ export default function Investigation() {
         if (isMounted) setLoading(false)
       })
 
-    return () => {
-      isMounted = false
-    }
+    return () => { isMounted = false }
   }, [scenarioId])
 
-  // Distinct Event IDs for quick filter chips
+  // ── Derived analytics ─────────────────────────────────────────────────────
+
+  // Distinct Event IDs + counts
   const eventIdCounts = useMemo(() => {
     const counts = {}
     for (const log of logs) {
@@ -93,26 +128,81 @@ export default function Investigation() {
     return counts
   }, [logs])
 
-  // Filtered logs
+  // Key evidence logs
+  const keyEvidenceLogs = useMemo(() => logs.filter(l => l.is_key_evidence), [logs])
+
+  // Detected attacker / suspicious IPs
+  const suspiciousIps = useMemo(() => classifyIPs(logs), [logs])
+  const suspiciousIpList = useMemo(() => Object.entries(suspiciousIps).sort((a, b) => b[1] - a[1]), [suspiciousIps])
+
+  // Sorted timestamps for time-range slider
+  const sortedTimestamps = useMemo(() => {
+    if (!logs.length) return []
+    return logs.map(l => new Date(l.timestamp).getTime()).sort((a, b) => a - b)
+  }, [logs])
+
+  const minTs = sortedTimestamps[0] || 0
+  const maxTs = sortedTimestamps[sortedTimestamps.length - 1] || 0
+
+  // Convert percentage to actual timestamp
+  const pctToTs = useCallback((pct) => {
+    if (minTs === maxTs) return minTs
+    return minTs + ((maxTs - minTs) * pct) / 100
+  }, [minTs, maxTs])
+
+  const filterStartTs = pctToTs(timeRangeIdx[0])
+  const filterEndTs = pctToTs(timeRangeIdx[1])
+
+  // Check if any filter is active (besides search)
+  const anyFilterActive =
+    selectedEventIds.length > 0 ||
+    selectedAttackerIp !== '' ||
+    keyEvidenceOnly ||
+    timeRangeIdx[0] !== 0 ||
+    timeRangeIdx[1] !== 100 ||
+    searchTerm.trim() !== ''
+
+  const clearAllFilters = () => {
+    setSelectedEventIds([])
+    setSelectedAttackerIp('')
+    setKeyEvidenceOnly(false)
+    setTimeRangeIdx([0, 100])
+    setSearchTerm('')
+  }
+
+  // ── Filtered logs ─────────────────────────────────────────────────────────
   const filteredLogs = useMemo(() => {
     return logs.filter((log) => {
-      if (selectedEventId !== 'ALL' && String(log.event_id) !== String(selectedEventId)) {
-        return false
-      }
-      if (!searchTerm.trim()) return true
-      const term = searchTerm.toLowerCase()
-      const matchEvent = String(log.event_id).includes(term)
-      const matchIp = (log.source_ip || '').toLowerCase().includes(term)
-      const matchUser = (log.username || '').toLowerCase().includes(term)
-      const matchHost = (log.target_host || '').toLowerCase().includes(term)
-      const matchRaw = JSON.stringify(log.raw_event_data || {}).toLowerCase().includes(term)
-      return matchEvent || matchIp || matchUser || matchHost || matchRaw
-    })
-  }, [logs, selectedEventId, searchTerm])
+      // 1. Multi-select event ID filter
+      if (selectedEventIds.length > 0 && !selectedEventIds.includes(String(log.event_id))) return false
 
-  useEffect(() => {
-    setCurrentPage(1)
-  }, [selectedEventId, searchTerm])
+      // 2. Attacker-IP quick filter
+      if (selectedAttackerIp && log.source_ip !== selectedAttackerIp) return false
+
+      // 3. Key-evidence-only
+      if (keyEvidenceOnly && !log.is_key_evidence) return false
+
+      // 4. Time-range
+      const ts = new Date(log.timestamp).getTime()
+      if (ts < filterStartTs || ts > filterEndTs) return false
+
+      // 5. Free-text search: event_id, ip, user, host, full raw JSON
+      if (searchTerm.trim()) {
+        const term = searchTerm.toLowerCase()
+        const matchEvent = String(log.event_id).includes(term)
+        const matchIp = (log.source_ip || '').toLowerCase().includes(term)
+        const matchUser = (log.username || '').toLowerCase().includes(term)
+        const matchHost = (log.target_host || '').toLowerCase().includes(term)
+        const matchRaw = JSON.stringify(log.raw_event_data || {}).toLowerCase().includes(term)
+        if (!matchEvent && !matchIp && !matchUser && !matchHost && !matchRaw) return false
+      }
+
+      return true
+    })
+  }, [logs, selectedEventIds, selectedAttackerIp, keyEvidenceOnly, filterStartTs, filterEndTs, searchTerm])
+
+  // Reset to page 1 whenever any filter changes
+  useEffect(() => { setCurrentPage(1) }, [selectedEventIds, selectedAttackerIp, keyEvidenceOnly, timeRangeIdx, searchTerm])
 
   const totalPages = Math.max(1, Math.ceil(filteredLogs.length / pageSize))
   const paginatedLogs = useMemo(() => {
@@ -120,15 +210,18 @@ export default function Investigation() {
     return filteredLogs.slice(start, start + pageSize)
   }, [filteredLogs, currentPage, pageSize])
 
-  // Pinned logs sorted chronologically
-  const pinnedLogs = useMemo(() => {
-    return logs.filter((l) => pinnedLogIds.includes(l.id))
-  }, [logs, pinnedLogIds])
+  // ── Pinned logs ───────────────────────────────────────────────────────────
+  const pinnedLogs = useMemo(() => logs.filter((l) => pinnedLogIds.includes(l.id)), [logs, pinnedLogIds])
 
   const togglePinLog = (e, logId) => {
     e.stopPropagation()
-    setPinnedLogIds((prev) =>
-      prev.includes(logId) ? prev.filter((id) => id !== logId) : [...prev, logId]
+    setPinnedLogIds((prev) => prev.includes(logId) ? prev.filter((id) => id !== logId) : [...prev, logId])
+  }
+
+  // Toggle a single event ID in multi-select
+  const toggleEventId = (evId) => {
+    setSelectedEventIds(prev =>
+      prev.includes(evId) ? prev.filter(id => id !== evId) : [...prev, evId]
     )
   }
 
@@ -193,14 +286,11 @@ export default function Investigation() {
 
   return (
     <div className="investigation-v2">
-      {/* Top Alert Banner */}
+      {/* ── Top Alert Banner ── */}
       {alert && (
         <div
           className="inv-alert-banner"
-          style={{
-            background: `${sevColor}12`,
-            borderColor: `${sevColor}55`,
-          }}
+          style={{ background: `${sevColor}12`, borderColor: `${sevColor}55` }}
         >
           <div className="inv-alert-left">
             <span className="inv-sev-pill" style={{ background: sevColor }}>
@@ -226,14 +316,12 @@ export default function Investigation() {
               </button>
             )}
             <span className="inv-log-count">{logs.length} Events Captured</span>
-            <Link to="/" className="inv-back-link">
-              ← Exit Incident
-            </Link>
+            <Link to="/" className="inv-back-link">← Exit Incident</Link>
           </div>
         </div>
       )}
 
-      {/* Collapsible Sigma Detection Rule Drawer */}
+      {/* ── Sigma Rule Drawer ── */}
       {showSigmaModal && alert?.sigma_rule && (
         <div className="sigma-rule-drawer">
           <div className="sigma-drawer-header">
@@ -250,9 +338,9 @@ export default function Investigation() {
       )}
 
       <div className="investigation-layout">
-        {/* LEFT PANEL: Logs, Attack Timeline, AD Context, Cheat Sheet */}
+        {/* ── LEFT PANEL ── */}
         <div className="log-panel">
-          {/* Workbench Navigation Bar */}
+          {/* Workbench Navigation Tabs */}
           <div className="soc-workbench-tabs">
             <button
               type="button"
@@ -279,7 +367,7 @@ export default function Investigation() {
                 onClick={() => setActiveLeftTab('ad_context')}
               >
                 <Network size={15} />
-                <span>AD Environment Context</span>
+                <span>AD Environment</span>
               </button>
             )}
 
@@ -289,55 +377,188 @@ export default function Investigation() {
               onClick={() => setActiveLeftTab('cheatsheet')}
             >
               <BookOpen size={15} />
-              <span>AD Event Cheat Sheet</span>
+              <span>Event Cheat Sheet</span>
             </button>
           </div>
 
-          {/* TAB 1: LOG VIEWER */}
+          {/* ── TAB 1: LOG VIEWER ── */}
           {activeLeftTab === 'logs' && (
             <>
-              <div className="inv-panel-header">
-                <div className="event-filter-chips">
+              {/* ─── Smart Filter Toolbar ─── */}
+              <div className="smart-filter-toolbar">
+
+                {/* Row 1: Event ID chips + Key Evidence toggle */}
+                <div className="filter-row">
+                  <div className="filter-label">
+                    <Filter size={12} />
+                    Event IDs
+                  </div>
+                  <div className="event-filter-chips">
+                    <button
+                      type="button"
+                      className={`event-chip ${selectedEventIds.length === 0 ? 'active' : ''}`}
+                      onClick={() => setSelectedEventIds([])}
+                    >
+                      All ({logs.length})
+                    </button>
+                    {Object.entries(eventIdCounts).map(([evId, cnt]) => (
+                      <button
+                        key={evId}
+                        type="button"
+                        className={`event-chip ${selectedEventIds.includes(evId) ? 'active' : ''}`}
+                        onClick={() => toggleEventId(evId)}
+                        title="Click to add/remove from filter. Multiple can be selected."
+                      >
+                        {evId} ({cnt})
+                      </button>
+                    ))}
+                  </div>
                   <button
                     type="button"
-                    className={`event-chip ${selectedEventId === 'ALL' ? 'active' : ''}`}
-                    onClick={() => setSelectedEventId('ALL')}
+                    className={`filter-toggle-btn ${keyEvidenceOnly ? 'active' : ''}`}
+                    onClick={() => setKeyEvidenceOnly(v => !v)}
+                    title="Show only logs marked as key evidence by the scenario author"
                   >
-                    All ({logs.length})
+                    <Zap size={12} />
+                    Key Evidence ({keyEvidenceLogs.length})
                   </button>
-                  {Object.entries(eventIdCounts).map(([evId, cnt]) => (
-                    <button
-                      key={evId}
-                      type="button"
-                      className={`event-chip ${String(selectedEventId) === String(evId) ? 'active' : ''}`}
-                      onClick={() => setSelectedEventId(evId)}
-                    >
-                      Event {evId} ({cnt})
-                    </button>
-                  ))}
                 </div>
 
-                <div className="inv-search-wrap">
-                  <Search size={14} className="inv-search-icon" />
-                  <input
-                    type="text"
-                    placeholder="Filter IP, user, host, or raw payload..."
-                    value={searchTerm}
-                    onChange={(e) => setSearchTerm(e.target.value)}
-                    className="inv-search-input"
-                  />
-                  {searchTerm && (
-                    <button
-                      type="button"
-                      className="inv-search-clear"
-                      onClick={() => setSearchTerm('')}
-                    >
-                      ×
+                {/* Row 2: Attacker IP quick-filter (only shown if suspicious IPs detected) */}
+                {suspiciousIpList.length > 0 && (
+                  <div className="filter-row">
+                    <div className="filter-label" style={{ color: '#ef4444' }}>
+                      <ShieldAlert size={12} />
+                      Suspect IPs
+                    </div>
+                    <div className="event-filter-chips">
+                      <button
+                        type="button"
+                        className={`event-chip attacker-chip ${selectedAttackerIp === '' ? 'active' : ''}`}
+                        onClick={() => setSelectedAttackerIp('')}
+                      >
+                        All Sources
+                      </button>
+                      {suspiciousIpList.map(([ip, cnt]) => (
+                        <button
+                          key={ip}
+                          type="button"
+                          className={`event-chip attacker-chip ${selectedAttackerIp === ip ? 'active' : ''}`}
+                          onClick={() => setSelectedAttackerIp(prev => prev === ip ? '' : ip)}
+                          title={`${cnt} events from this IP — possible attacker source`}
+                        >
+                          🔴 {ip} ({cnt})
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Row 3: Time range slider */}
+                {sortedTimestamps.length > 1 && (
+                  <div className="filter-row filter-row-time">
+                    <div className="filter-label">
+                      <Clock size={12} />
+                      Time Range
+                    </div>
+                    <div className="time-range-wrap">
+                      <span className="time-range-label">
+                        {new Date(filterStartTs).toLocaleTimeString()}
+                      </span>
+                      <div className="dual-slider-wrap">
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={1}
+                          value={timeRangeIdx[0]}
+                          className="range-slider range-slider-start"
+                          onChange={e => {
+                            const v = Number(e.target.value)
+                            setTimeRangeIdx(prev => [Math.min(v, prev[1] - 1), prev[1]])
+                          }}
+                        />
+                        <input
+                          type="range"
+                          min={0}
+                          max={100}
+                          step={1}
+                          value={timeRangeIdx[1]}
+                          className="range-slider range-slider-end"
+                          onChange={e => {
+                            const v = Number(e.target.value)
+                            setTimeRangeIdx(prev => [prev[0], Math.max(v, prev[0] + 1)])
+                          }}
+                        />
+                      </div>
+                      <span className="time-range-label">
+                        {new Date(filterEndTs).toLocaleTimeString()}
+                      </span>
+                    </div>
+                    {(timeRangeIdx[0] !== 0 || timeRangeIdx[1] !== 100) && (
+                      <button
+                        type="button"
+                        className="filter-clear-mini"
+                        onClick={() => setTimeRangeIdx([0, 100])}
+                        title="Reset time range"
+                      >
+                        <X size={11} /> Reset
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Row 4: Free-text search + active filter summary + clear */}
+                <div className="filter-row">
+                  <div className="inv-search-wrap" style={{ flex: 1 }}>
+                    <Search size={14} className="inv-search-icon" />
+                    <input
+                      type="text"
+                      placeholder="Search IP, user, host, hex value, Event ID, or any raw field..."
+                      value={searchTerm}
+                      onChange={(e) => setSearchTerm(e.target.value)}
+                      className="inv-search-input"
+                    />
+                    {searchTerm && (
+                      <button type="button" className="inv-search-clear" onClick={() => setSearchTerm('')}>×</button>
+                    )}
+                  </div>
+                  {anyFilterActive && (
+                    <button type="button" className="filter-clear-all-btn" onClick={clearAllFilters}>
+                      <X size={13} /> Clear All Filters
                     </button>
                   )}
                 </div>
+
+                {/* Active filter summary chips */}
+                {(selectedEventIds.length > 0 || selectedAttackerIp || keyEvidenceOnly) && (
+                  <div className="active-filter-pills">
+                    {selectedEventIds.map(evId => (
+                      <span key={evId} className="active-filter-pill">
+                        Event {evId}
+                        <button type="button" onClick={() => toggleEventId(evId)}><X size={10} /></button>
+                      </span>
+                    ))}
+                    {selectedAttackerIp && (
+                      <span className="active-filter-pill pill-attacker">
+                        🔴 {selectedAttackerIp}
+                        <button type="button" onClick={() => setSelectedAttackerIp('')}><X size={10} /></button>
+                      </span>
+                    )}
+                    {keyEvidenceOnly && (
+                      <span className="active-filter-pill pill-evidence">
+                        ⚡ Key Evidence Only
+                        <button type="button" onClick={() => setKeyEvidenceOnly(false)}><X size={10} /></button>
+                      </span>
+                    )}
+                    <span className="active-filter-result">
+                      → {filteredLogs.length} of {logs.length} events
+                    </span>
+                  </div>
+                )}
               </div>
 
+              {/* ─── Log Table ─── */}
               <div className="log-table-wrapper">
                 <table className="log-table">
                   <thead>
@@ -355,18 +576,27 @@ export default function Investigation() {
                       <tr>
                         <td colSpan="6" className="empty">
                           No logs match your active filter criteria.
+                          {anyFilterActive && (
+                            <button type="button" className="btn-sm btn-secondary" style={{ marginLeft: 10 }} onClick={clearAllFilters}>
+                              Clear Filters
+                            </button>
+                          )}
                         </td>
                       </tr>
                     ) : (
                       paginatedLogs.map((log) => {
                         const isExpanded = expandedLogId === log.id
                         const isPinned = pinnedLogIds.includes(log.id)
+                        const isKeyEvidence = log.is_key_evidence
+                        const isSuspectIp = suspiciousIps[log.source_ip] !== undefined
                         const dt = new Date(log.timestamp)
                         const dateStr = dt.toLocaleDateString()
                         const timeStr = dt.toLocaleTimeString()
 
                         const rowClass =
-                          log.event_id === 4624
+                          isKeyEvidence
+                            ? 'key-evidence-row'
+                            : log.event_id === 4624
                             ? 'success-event'
                             : log.event_id === 4625
                             ? 'failure-event'
@@ -375,9 +605,7 @@ export default function Investigation() {
                         return (
                           <React.Fragment key={log.id}>
                             <tr
-                              className={`inv-log-row ${rowClass} ${isExpanded ? 'log-row-expanded' : ''} ${
-                                isPinned ? 'log-row-pinned' : ''
-                              }`}
+                              className={`inv-log-row ${rowClass} ${isExpanded ? 'log-row-expanded' : ''} ${isPinned ? 'log-row-pinned' : ''}`}
                               onClick={() => setExpandedLogId(isExpanded ? null : log.id)}
                             >
                               <td>
@@ -406,8 +634,16 @@ export default function Investigation() {
                                 >
                                   {log.event_id}
                                 </span>
+                                {isKeyEvidence && (
+                                  <span className="key-evidence-badge" title="Flagged as key evidence by scenario author">
+                                    ⚡
+                                  </span>
+                                )}
                               </td>
-                              <td className="inv-ip">{log.source_ip || '—'}</td>
+                              <td className={`inv-ip ${isSuspectIp ? 'suspect-ip' : ''}`}>
+                                {log.source_ip || '—'}
+                                {isSuspectIp && <span className="suspect-ip-dot" title="Suspicious source IP" />}
+                              </td>
                               <td>{log.username || '—'}</td>
                               <td>{log.target_host || '—'}</td>
                             </tr>
@@ -427,38 +663,29 @@ export default function Investigation() {
               </div>
 
               {filteredLogs.length > 0 && (
-                <div className="inv-pagination-bar" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 12, padding: '8px 14px', background: 'var(--surface)', border: '1px solid var(--border)', borderRadius: 8, fontSize: '0.82rem' }}>
+                <div className="inv-pagination-bar">
                   <div>
-                    Showing <strong>{(currentPage - 1) * pageSize + 1}</strong>–<strong>{Math.min(currentPage * pageSize, filteredLogs.length)}</strong> of <strong>{filteredLogs.length}</strong> matching events
+                    Showing <strong>{(currentPage - 1) * pageSize + 1}</strong>–<strong>{Math.min(currentPage * pageSize, filteredLogs.length)}</strong> of <strong>{filteredLogs.length}</strong> events
                   </div>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <label style={{ color: 'var(--text-dim)' }}>
                       Rows:
                       <select
                         value={pageSize}
-                        onChange={(e) => { setPageSize(Number(e.target.value)); setCurrentPage(1); }}
+                        onChange={(e) => { setPageSize(Number(e.target.value)); setCurrentPage(1) }}
                         style={{ marginLeft: 6, background: 'var(--bg)', color: 'var(--text)', border: '1px solid var(--border)', borderRadius: 4, padding: '2px 6px' }}
                       >
                         <option value={50}>50</option>
                         <option value={100}>100</option>
                         <option value={250}>250</option>
+                        <option value={500}>500</option>
                       </select>
                     </label>
-                    <button
-                      type="button"
-                      className="btn-sm btn-secondary"
-                      disabled={currentPage <= 1}
-                      onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-                    >
+                    <button type="button" className="btn-sm btn-secondary" disabled={currentPage <= 1} onClick={() => setCurrentPage(p => Math.max(1, p - 1))}>
                       ← Prev
                     </button>
                     <span>Page {currentPage} / {totalPages}</span>
-                    <button
-                      type="button"
-                      className="btn-sm btn-secondary"
-                      disabled={currentPage >= totalPages}
-                      onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
-                    >
+                    <button type="button" className="btn-sm btn-secondary" disabled={currentPage >= totalPages} onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}>
                       Next →
                     </button>
                   </div>
@@ -467,7 +694,7 @@ export default function Investigation() {
             </>
           )}
 
-          {/* TAB 2: PINNED ATTACK TIMELINE */}
+          {/* ── TAB 2: PINNED ATTACK TIMELINE ── */}
           {activeLeftTab === 'timeline' && (
             <div className="soc-context-card">
               <h4>📌 Reconstructed Attack Timeline ({pinnedLogs.length} Pinned Events)</h4>
@@ -482,20 +709,17 @@ export default function Investigation() {
               ) : (
                 <div className="timeline-list">
                   {pinnedLogs.map((log, idx) => (
-                    <div key={log.id} className="timeline-item">
+                    <div key={log.id} className={`timeline-item ${log.is_key_evidence ? 'timeline-key-evidence' : ''}`}>
                       <div className="timeline-step-badge">{idx + 1}</div>
                       <div className="timeline-item-body">
                         <div className="timeline-item-top">
                           <span className="event-badge">Event {log.event_id}</span>
+                          {log.is_key_evidence && <span className="key-evidence-badge">⚡ Key Evidence</span>}
                           <span className="inv-ip">{new Date(log.timestamp).toLocaleString()}</span>
                           <span>User: <strong>{log.username || '—'}</strong></span>
                           <span>Source IP: <strong>{log.source_ip || '—'}</strong></span>
                           <span>Host: <strong>{log.target_host || '—'}</strong></span>
-                          <button
-                            type="button"
-                            className="btn-sm btn-secondary"
-                            onClick={(e) => togglePinLog(e, log.id)}
-                          >
+                          <button type="button" className="btn-sm btn-secondary" onClick={(e) => togglePinLog(e, log.id)}>
                             Unpin
                           </button>
                         </div>
@@ -507,7 +731,7 @@ export default function Investigation() {
             </div>
           )}
 
-          {/* TAB 3: ACTIVE DIRECTORY ENVIRONMENT CONTEXT */}
+          {/* ── TAB 3: AD CONTEXT ── */}
           {activeLeftTab === 'ad_context' && scenario?.ad_context && (
             <div className="soc-context-card">
               <h4>🏢 Active Directory Topology & Asset Directory</h4>
@@ -520,13 +744,19 @@ export default function Investigation() {
             </div>
           )}
 
-          {/* TAB 4: WINDOWS AD CHEAT SHEET */}
+          {/* ── TAB 4: CHEAT SHEET ── */}
           {activeLeftTab === 'cheatsheet' && (
             <div className="soc-context-card">
               <h4>📖 Windows Active Directory SOC Event Reference</h4>
               <div className="cheatsheet-grid">
                 {EVENT_CHEAT_SHEET.map((item) => (
-                  <div key={item.id} className="cheatsheet-item">
+                  <div
+                    key={item.id}
+                    className={`cheatsheet-item ${selectedEventIds.includes(String(item.id)) ? 'cheatsheet-item-active' : ''}`}
+                    onClick={() => { toggleEventId(String(item.id)); setActiveLeftTab('logs') }}
+                    title={`Click to filter by Event ${item.id}`}
+                    style={{ cursor: 'pointer' }}
+                  >
                     <div className="cheatsheet-id">Event {item.id}</div>
                     <div>
                       <strong>{item.title}</strong>
@@ -539,7 +769,7 @@ export default function Investigation() {
           )}
         </div>
 
-        {/* RIGHT PANEL: Investigation Questions & Case Submission */}
+        {/* ── RIGHT PANEL: Questions & Submission ── */}
         <div className="questions-panel inv-qa-panel">
           <div className="inv-qa-header">
             <div className="inv-qa-title">
