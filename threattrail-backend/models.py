@@ -1,10 +1,13 @@
 from sqlalchemy import (
-    Column, Integer, String, Text, ForeignKey, DateTime, Boolean, Index, Enum as SAEnum
+    Column, Integer, String, Text, ForeignKey, DateTime, Boolean, Index, JSON, Enum as SAEnum
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from database import Base
 import enum
+
+# Dialect-aware JSON type: uses binary JSONB on PostgreSQL and standard JSON on SQLite
+JSONType = JSON().with_variant(JSONB, "postgresql")
 
 
 class SeverityLevel(str, enum.Enum):
@@ -33,8 +36,7 @@ class Scenario(Base):
     description = Column(Text, nullable=False)
     mitre_technique = Column(String(100), nullable=False)
     status = Column(String(20), default="Draft", nullable=False)
-    # Active Directory environment context (Domain Controllers, Users, SPNs, Tier-0 assets)
-    ad_context = Column(JSONB, nullable=True, default=dict)
+    ad_context = Column(JSONType, nullable=True, default=dict)
 
     alerts = relationship("Alert", back_populates="scenario", cascade="all, delete-orphan")
     logs = relationship("Log", back_populates="scenario", cascade="all, delete-orphan")
@@ -49,7 +51,6 @@ class Alert(Base):
     scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
     title = Column(String(300), nullable=False)
     severity = Column(SAEnum(SeverityLevel), nullable=False)
-    # Static Sigma Rule / Detection Query so trainees learn how detections work without a live SIEM engine
     sigma_rule = Column(Text, nullable=True)
 
     scenario = relationship("Scenario", back_populates="alerts")
@@ -70,7 +71,7 @@ class Log(Base):
     username = Column(String(150), nullable=True)
     target_host = Column(String(200), nullable=True)
     is_key_evidence = Column(Boolean, default=False, nullable=False)
-    raw_event_data = Column(JSONB, nullable=False)
+    raw_event_data = Column(JSONType, nullable=False)
 
     scenario = relationship("Scenario", back_populates="logs")
 
@@ -82,8 +83,7 @@ class Question(Base):
     scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
     question_text = Column(Text, nullable=False)
     correct_answer = Column(String(300), nullable=False)
-    # Comma-separated or JSON list of acceptable aliases (e.g. ["CORP\svc_backup", "svc_backup@corp.local"])
-    acceptable_answers = Column(JSONB, nullable=True, default=list)
+    acceptable_answers = Column(JSONType, nullable=True, default=list)
     explanation = Column(Text, nullable=True)
     points = Column(Integer, default=10, nullable=False)
 
@@ -99,7 +99,7 @@ class InvestigationResult(Base):
     score = Column(Integer, nullable=False)
     points_earned = Column(Integer, default=0, nullable=False)
     total_points = Column(Integer, default=0, nullable=False)
-    pinned_log_ids = Column(JSONB, nullable=True, default=list)
+    pinned_log_ids = Column(JSONType, nullable=True, default=list)
 
     user = relationship("User", back_populates="investigation_results")
     scenario = relationship("Scenario", back_populates="investigation_results")

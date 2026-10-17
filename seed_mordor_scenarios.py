@@ -408,7 +408,7 @@ def main():
     db = SessionLocal()
     try:
         for item in MORDOR_SCENARIOS:
-            zpath = ROOT / item["zip_name"]
+            zpath = ROOT / item["zip_name"] if (ROOT / item["zip_name"]).exists() else ROOT.parent / item["zip_name"]
             if not zpath.exists():
                 print(f"[SKIP] {item['zip_name']} not found in root.")
                 continue
