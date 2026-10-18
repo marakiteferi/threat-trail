@@ -20,6 +20,12 @@ ir_cols = [r[1] for r in cur.fetchall()]
 if "hints_used" not in ir_cols:
     print("[+] Adding 'hints_used' column to investigation_results table...")
     cur.execute("ALTER TABLE investigation_results ADD COLUMN hints_used JSON;")
+if "free_hint_id" not in ir_cols:
+    print("[+] Adding 'free_hint_id' column to investigation_results table...")
+    cur.execute("ALTER TABLE investigation_results ADD COLUMN free_hint_id INTEGER;")
+if "free_hints_used" not in ir_cols:
+    print("[+] Adding 'free_hints_used' column to investigation_results table...")
+    cur.execute("ALTER TABLE investigation_results ADD COLUMN free_hints_used JSON;")
 if "trials_count" not in ir_cols:
     print("[+] Adding 'trials_count' column to investigation_results table...")
     cur.execute("ALTER TABLE investigation_results ADD COLUMN trials_count INTEGER DEFAULT 1;")
@@ -29,6 +35,21 @@ if "user_guesses" not in ir_cols:
 if "submitted_at" not in ir_cols:
     print("[+] Adding 'submitted_at' column to investigation_results table...")
     cur.execute("ALTER TABLE investigation_results ADD COLUMN submitted_at DATETIME;")
+
+# 3. Update users table
+cur.execute("PRAGMA table_info(users);")
+u_cols = [r[1] for r in cur.fetchall()]
+if "created_at" not in u_cols:
+    print("[+] Adding 'created_at' column to users table...")
+    cur.execute("ALTER TABLE users ADD COLUMN created_at DATETIME;")
+    cur.execute("UPDATE users SET created_at = datetime('now') WHERE created_at IS NULL;")
+if "email" not in u_cols:
+    print("[+] Adding 'email' column to users table...")
+    cur.execute("ALTER TABLE users ADD COLUMN email TEXT;")
+if "avatar_color" not in u_cols:
+    print("[+] Adding 'avatar_color' column to users table...")
+    cur.execute("ALTER TABLE users ADD COLUMN avatar_color TEXT DEFAULT '#3b82f6';")
+    cur.execute("UPDATE users SET avatar_color = '#3b82f6' WHERE avatar_color IS NULL;")
 
 conn.commit()
 
