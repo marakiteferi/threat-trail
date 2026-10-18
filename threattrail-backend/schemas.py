@@ -51,6 +51,7 @@ class QuestionOut(BaseModel):
     scenario_id: int
     question_text: str
     points: int = 10
+    has_hint: bool = True
     # correct_answer & acceptable_answers excluded for trainees
 
     model_config = {"from_attributes": True}
@@ -63,21 +64,45 @@ class QuestionAdminOut(BaseModel):
     correct_answer: str
     acceptable_answers: Optional[list[str]] = Field(default_factory=list)
     explanation: Optional[str] = None
+    hint: Optional[str] = None
     points: int = 10
 
     model_config = {"from_attributes": True}
 
 
-# ── Submission (request body) ─────────────────────────────────────────────────
+# ── Submission & Hint (request bodies) ────────────────────────────────────────
 
 class AnswerSubmission(BaseModel):
     question_id: int
     answer: str
 
 
+class VerifyFindingRequest(BaseModel):
+    question_id: int
+    answer: str
+
+
+class VerifyFindingResponse(BaseModel):
+    question_id: int
+    is_correct: bool
+    message: str
+
+
+class HintResponse(BaseModel):
+    question_id: int
+    hint: str
+    point_deduction: int = 15
+    is_free: bool = False
+
+
 class SubmissionRequest(BaseModel):
     answers: list[AnswerSubmission]
     pinned_log_ids: Optional[list[int]] = Field(default_factory=list)
+    hints_used: Optional[list[int]] = Field(default_factory=list)
+    free_hint_id: Optional[int] = None
+    free_hints_used: Optional[list[int]] = Field(default_factory=list)
+    trials_count: Optional[int] = 1
+    user_guesses: Optional[dict[str, list[str]]] = Field(default_factory=dict)
 
 
 # ── Grading result (response) ─────────────────────────────────────────────────
@@ -102,6 +127,11 @@ class SubmissionResponse(BaseModel):
     score_percent: int
     pinned_log_ids: list[int] = Field(default_factory=list)
     key_evidence_log_ids: list[int] = Field(default_factory=list)
+    hints_used: list[int] = Field(default_factory=list)
+    free_hint_id: Optional[int] = None
+    free_hints_used: list[int] = Field(default_factory=list)
+    hint_penalty: int = 0
+    trials_count: int = 1
     results: list[QuestionResult]
 
 
@@ -208,12 +238,96 @@ class UserLogin(BaseModel):
 class UserOut(BaseModel):
     id: int
     username: str
+    email: Optional[str] = None
     role: str
+    avatar_color: Optional[str] = '#3b82f6'
+    created_at: Optional[datetime] = None
 
     model_config = {"from_attributes": True}
+
+
+class UserAdminOut(BaseModel):
+    id: int
+    username: str
+    role: str
+    created_at: Optional[datetime] = None
+    submissions_count: int = 0
+    total_points: int = 0
+    average_score: int = 0
+
+    model_config = {"from_attributes": True}
+
+
+class UserAdminCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+
+class UserAdminUpdateRole(BaseModel):
+    role: str
+
+
+class UserAdminResetPassword(BaseModel):
+    password: str
 
 
 class AuthResponse(BaseModel):
     token: str
     user: UserOut
     message: str = "Success"
+
+
+class UserProfileUpdate(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+    current_password: Optional[str] = None
+    new_password: Optional[str] = None
+    avatar_color: Optional[str] = None
+
+
+class UserProfileOut(BaseModel):
+    id: int
+    username: str
+    email: Optional[str] = None
+    role: str
+    avatar_color: Optional[str] = '#3b82f6'
+    created_at: Optional[datetime] = None
+
+    model_config = {"from_attributes": True}
+
+
+# ── Activity & Leaderboard Schemas ───────────────────────────────────────────
+
+class SubmissionAdminOut(BaseModel):
+    id: int
+    user_id: int
+    username: str
+    user_role: str
+    scenario_id: int
+    scenario_name: str
+    mitre_technique: str
+    score: int
+    points_earned: int
+    total_points: int
+    hints_used: list[int] = Field(default_factory=list)
+    free_hint_id: Optional[int] = None
+    free_hints_used: list[int] = Field(default_factory=list)
+    hint_penalty: int = 0
+    trials_count: int = 1
+    user_guesses: Optional[dict[str, Any]] = Field(default_factory=dict)
+    submitted_at: Optional[str] = None
+
+
+class LeaderboardUserOut(BaseModel):
+    rank: int
+    user_id: int
+    username: str
+    role: str
+    total_points: int
+    scenarios_completed: int
+    average_score: int
+    total_trials: int
+    hints_used_count: int
+    status: str
+    badge: str

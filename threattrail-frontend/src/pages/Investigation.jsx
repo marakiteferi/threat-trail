@@ -19,6 +19,11 @@ import {
   X,
   Eye,
   EyeOff,
+  Info,
+  HelpCircle,
+  AlertTriangle,
+  Lock,
+  Lightbulb,
 } from 'lucide-react'
 
 const EVENT_CHEAT_SHEET = [
@@ -87,6 +92,16 @@ export default function Investigation() {
   const [loading, setLoading] = useState(true)
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+
+  // ── Verification, Trials, Guesses & Hints ──────────────────────────────────
+  const [trialsCount, setTrialsCount] = useState({})
+  const [questionGuesses, setQuestionGuesses] = useState({})
+  const [unlockedFreeHints, setUnlockedFreeHints] = useState({})
+  const [freeHintsUsed, setFreeHintsUsed] = useState([]) // [qId, ...] free hints used (0 pts penalty)
+  const [unlockedPaidHints, setUnlockedPaidHints] = useState({})
+  const [hintsUsed, setHintsUsed] = useState([]) // Paid forensic hints (-15 pts each)
+  const [verifyingId, setVerifyingId] = useState(null)
+  const [verifyStatus, setVerifyStatus] = useState({})
 
   useEffect(() => {
     let isMounted = true
@@ -229,16 +244,96 @@ export default function Investigation() {
     setAnswers((prev) => ({ ...prev, [qId]: val }))
   }
 
+  const handleVerifyFinding = async (questionId) => {
+    const answer = (answers[questionId] || '').trim()
+    if (!answer) return
+
+    setVerifyingId(questionId)
+    try {
+      const res = await api.post(`/scenarios/${scenarioId}/verify-finding`, {
+        question_id: questionId,
+        answer: answer,
+      })
+      const isCorrect = res.data.is_correct
+
+      // Record guess in questionGuesses
+      setQuestionGuesses(prev => ({
+        ...prev,
+        [questionId]: [...(prev[questionId] || []), answer]
+      }))
+
+      if (!isCorrect) {
+        setTrialsCount(prev => ({
+          ...prev,
+          [questionId]: (prev[questionId] || 0) + 1
+        }))
+      }
+
+      setVerifyStatus(prev => ({
+        ...prev,
+        [questionId]: {
+          correct: isCorrect,
+          message: res.data.message
+        }
+      }))
+    } catch (err) {
+      console.error('Failed to verify finding:', err)
+    } finally {
+      setVerifyingId(null)
+    }
+  }
+
+  const handleUseFreeHint = async (questionId, qIndex) => {
+    if (unlockedFreeHints[questionId]) return
+
+    try {
+      const res = await api.post(`/scenarios/${scenarioId}/questions/${questionId}/hint?is_free=true`)
+      setUnlockedFreeHints(prev => ({
+        ...prev,
+        [questionId]: res.data.hint
+      }))
+      setFreeHintsUsed(prev => prev.includes(questionId) ? prev : [...prev, questionId])
+    } catch (err) {
+      window.alert('Failed to retrieve free hint: ' + (err.response?.data?.detail || err.message))
+    }
+  }
+
+  const handleUnlockPaidHint = async (questionId) => {
+    if (unlockedPaidHints[questionId]) return
+
+    const confirmed = window.confirm(
+      "⚠️ FORENSIC HINT DEDUCTION\n\nUnlocking this forensic hint will deduct 15 points from your scenario score.\n\nDo you want to unlock the hint?"
+    )
+    if (!confirmed) return
+
+    try {
+      const res = await api.post(`/scenarios/${scenarioId}/questions/${questionId}/hint?is_free=false`)
+      setUnlockedPaidHints(prev => ({
+        ...prev,
+        [questionId]: res.data.hint
+      }))
+      setHintsUsed(prev => prev.includes(questionId) ? prev : [...prev, questionId])
+    } catch (err) {
+      window.alert('Failed to retrieve hint: ' + (err.response?.data?.detail || err.message))
+    }
+  }
+
   const handleSubmit = async (e) => {
     e.preventDefault()
     setSubmitting(true)
     try {
+      const totalTrials = Object.values(trialsCount).reduce((a, b) => a + b, 0) + 1
       const payload = {
         answers: questions.map((q) => ({
           question_id: q.id,
           answer: answers[q.id] || '',
         })),
         pinned_log_ids: pinnedLogIds,
+        hints_used: hintsUsed,
+        free_hint_id: freeHintsUsed[0] || null,
+        free_hints_used: freeHintsUsed,
+        trials_count: totalTrials,
+        user_guesses: questionGuesses,
       }
       const res = await api.post(`/scenarios/${scenarioId}/submit`, payload)
       sessionStorage.setItem(`report_${scenarioId}`, JSON.stringify(res.data))
@@ -316,7 +411,14 @@ export default function Investigation() {
               </button>
             )}
             <span className="inv-log-count">{logs.length} Events Captured</span>
-            <Link to="/" className="inv-back-link">← Exit Incident</Link>
+            <button
+              type="button"
+              className="inv-back-btn"
+              onClick={() => navigate(-1)}
+              title="Go back to previous page"
+            >
+              ← Back
+            </button>
           </div>
         </div>
       )}
@@ -422,6 +524,14 @@ export default function Investigation() {
                     <Zap size={12} />
                     Key Evidence ({keyEvidenceLogs.length})
                   </button>
+                </div>
+
+                {/* Event ID Guide Callout */}
+                <div className="event-id-hint-banner">
+                  <Info size={13} className="event-hint-icon" />
+                  <span>
+                    <strong>Event ID Guide:</strong> Event IDs indicate action categories (e.g. <code>4625</code> = Failed Logon, <code>4624</code> = Successful Logon). Repeated Event IDs show repeated attempts or background events. Use <strong>Timestamp</strong>, <strong>Username</strong>, and <strong>Source IP</strong> to tell them apart.
+                  </span>
                 </div>
 
                 {/* Row 2: Attacker IP quick-filter (only shown if suspicious IPs detected) */}
@@ -558,6 +668,81 @@ export default function Investigation() {
                 )}
               </div>
 
+              {/* ─── Color Legend & Detection Hint Bar ─── */}
+              <div className="log-color-legend">
+                <div className="legend-label">
+                  <Eye size={13} />
+                  <span>Color Guide & Hints:</span>
+                </div>
+                <div className="legend-items">
+                  <div
+                    className={`legend-pill pill-red ${selectedEventIds.includes('4625') ? 'active' : ''}`}
+                    onClick={() => toggleEventId('4625')}
+                    title="Click to toggle Event 4625 (Failed Logon) filter"
+                  >
+                    <span className="legend-dot dot-red" />
+                    <span className="legend-name">Red (4625/4771)</span>
+                    <span className="legend-desc">Auth Failure (Spray/Brute Force)</span>
+                  </div>
+
+                  <div
+                    className={`legend-pill pill-green ${selectedEventIds.includes('4624') ? 'active' : ''}`}
+                    onClick={() => toggleEventId('4624')}
+                    title="Click to toggle Event 4624 (Successful Logon) filter"
+                  >
+                    <span className="legend-dot dot-green" />
+                    <span className="legend-name">Green (4624/4672)</span>
+                    <span className="legend-desc">Success (Compromised Logon)</span>
+                  </div>
+
+                  <div
+                    className={`legend-pill pill-orange ${selectedEventIds.includes('4769') ? 'active' : ''}`}
+                    onClick={() => toggleEventId('4769')}
+                    title="Click to toggle Event 4769 (Kerberos) filter"
+                  >
+                    <span className="legend-dot dot-orange" />
+                    <span className="legend-name">Orange (4769/4768)</span>
+                    <span className="legend-desc">Kerberos TGS / Kerberoasting</span>
+                  </div>
+
+                  <div
+                    className={`legend-pill pill-purple ${selectedEventIds.includes('4662') ? 'active' : ''}`}
+                    onClick={() => toggleEventId('4662')}
+                    title="Click to toggle Event 4662 (DCSync) filter"
+                  >
+                    <span className="legend-dot dot-purple" />
+                    <span className="legend-name">Purple (4662/7045)</span>
+                    <span className="legend-desc">DCSync / Service Install</span>
+                  </div>
+
+                  <div
+                    className={`legend-pill pill-cyan ${selectedEventIds.includes('4688') ? 'active' : ''}`}
+                    onClick={() => toggleEventId('4688')}
+                    title="Click to toggle Event 4688 (Process) filter"
+                  >
+                    <span className="legend-dot dot-cyan" />
+                    <span className="legend-name">Cyan (4688/Sysmon)</span>
+                    <span className="legend-desc">Process Execution</span>
+                  </div>
+
+                  <div
+                    className={`legend-pill pill-gold ${keyEvidenceOnly ? 'active' : ''}`}
+                    onClick={() => setKeyEvidenceOnly(v => !v)}
+                    title="Click to toggle key evidence"
+                  >
+                    <span className="legend-badge-bolt">⚡</span>
+                    <span className="legend-name">Gold Badge</span>
+                    <span className="legend-desc">Key Evidence</span>
+                  </div>
+
+                  <div className="legend-pill pill-suspect-ip" title="IP generating abnormal authentication failures">
+                    <span className="suspect-ip-dot" />
+                    <span className="legend-name">Pulsing Dot</span>
+                    <span className="legend-desc">Suspect IP</span>
+                  </div>
+                </div>
+              </div>
+
               {/* ─── Log Table ─── */}
               <div className="log-table-wrapper">
                 <table className="log-table">
@@ -596,11 +781,24 @@ export default function Investigation() {
                         const rowClass =
                           isKeyEvidence
                             ? 'key-evidence-row'
+                            : log.event_id === 4625 || log.event_id === 4771
+                            ? 'failure-event'
                             : log.event_id === 4624
                             ? 'success-event'
-                            : log.event_id === 4625
-                            ? 'failure-event'
+                            : log.event_id === 4769 || log.event_id === 4768
+                            ? 'kerberos-event'
+                            : log.event_id === 4662
+                            ? 'privilege-event'
                             : ''
+
+                        const getBadgeClass = (evId) => {
+                          if (evId === 4624 || evId === 4672) return 'event-success'
+                          if (evId === 4625 || evId === 4771) return 'event-failure'
+                          if (evId === 4768 || evId === 4769) return 'event-kerberos'
+                          if (evId === 4662 || evId === 7045) return 'event-privilege'
+                          if (evId === 4688 || evId === 1 || evId === 3 || evId === 10) return 'event-process'
+                          return ''
+                        }
 
                         return (
                           <React.Fragment key={log.id}>
@@ -623,15 +821,7 @@ export default function Investigation() {
                                 <span className="inv-ts-time">{timeStr}</span>
                               </td>
                               <td>
-                                <span
-                                  className={`event-badge ${
-                                    log.event_id === 4624
-                                      ? 'event-success'
-                                      : log.event_id === 4625
-                                      ? 'event-failure'
-                                      : ''
-                                  }`}
-                                >
+                                <span className={`event-badge ${getBadgeClass(log.event_id)}`}>
                                   {log.event_id}
                                 </span>
                                 {isKeyEvidence && (
@@ -790,30 +980,135 @@ export default function Investigation() {
             {questions.map((q, idx) => {
               const val = answers[q.id] || ''
               const isFilled = val.trim().length > 0
+              const status = verifyStatus[q.id]
+              const wrongCount = trialsCount[q.id] || 0
+              const hasFreeHint = !!unlockedFreeHints[q.id]
+              const hasPaidHint = !!unlockedPaidHints[q.id]
+
               return (
                 <div
                   key={q.id}
-                  className={`question-block inv-question-block ${isFilled ? 'inv-q-answered' : ''}`}
+                  className={`question-block inv-question-block ${isFilled ? 'inv-q-answered' : ''} ${
+                    status?.correct ? 'inv-q-correct' : status?.correct === false ? 'inv-q-incorrect' : ''
+                  }`}
                 >
                   <div className="inv-q-label-row">
                     <span className="inv-q-num">{idx + 1}</span>
                     <label className="inv-q-text">{q.question_text}</label>
-                    <span className="q-points-badge">{q.points || 10} pts</span>
+                    <div className="q-label-meta-cluster">
+                      {!hasFreeHint ? (
+                        <button
+                          type="button"
+                          className="btn-free-hint-sm"
+                          onClick={() => handleUseFreeHint(q.id, idx)}
+                          title="Get 1 Free Starter Hint for this question (0 pts penalty)"
+                        >
+                          🎁 Free Hint
+                        </button>
+                      ) : (
+                        <span className="free-hint-active-pill" title="Free starter clue unlocked for this question">
+                          🎁 Free Hint Unlocked
+                        </span>
+                      )}
+                      <span className="q-points-badge">{q.points || 10} pts</span>
+                    </div>
                   </div>
-                  <div className="inv-input-wrap">
-                    <input
-                      type="text"
-                      className={`answer-input inv-answer-input ${isFilled ? 'inv-input-filled' : ''}`}
-                      placeholder="Enter finding (e.g. IP, username, MITRE ID)..."
-                      value={val}
-                      onChange={(e) => handleAnswerChange(q.id, e.target.value)}
-                      required
-                    />
-                    {isFilled && <span className="inv-check">✓</span>}
+
+                  <div className="inv-input-action-row">
+                    <div className="inv-input-wrap" style={{ flex: 1 }}>
+                      <input
+                        type="text"
+                        className={`answer-input inv-answer-input ${isFilled ? 'inv-input-filled' : ''} ${
+                          status?.correct ? 'inv-input-correct' : status?.correct === false ? 'inv-input-incorrect' : ''
+                        }`}
+                        placeholder="Enter finding (e.g. IP, username, MITRE ID)..."
+                        value={val}
+                        onChange={(e) => handleAnswerChange(q.id, e.target.value)}
+                        required
+                      />
+                      {isFilled && <span className="inv-check">✓</span>}
+                    </div>
+
+                    <button
+                      type="button"
+                      className={`btn-verify-finding ${status?.correct ? 'verified' : ''}`}
+                      onClick={() => handleVerifyFinding(q.id)}
+                      disabled={verifyingId === q.id || !isFilled}
+                      title="Test this finding before submitting the report"
+                    >
+                      {verifyingId === q.id ? 'Checking...' : status?.correct ? 'Verified ✓' : 'Verify'}
+                    </button>
+                  </div>
+
+                  {/* Verification message / error badge */}
+                  {status && (
+                    <div className={`verify-feedback-msg ${status.correct ? 'msg-success' : 'msg-error'}`}>
+                      {status.correct ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}
+                      <span>{status.message}</span>
+                      {!status.correct && wrongCount > 0 && (
+                        <span className="attempt-badge">Failed attempts: {wrongCount}</span>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Free Hint Banner (if unlocked) */}
+                  {hasFreeHint && (
+                    <div className="unlocked-hint-box unlocked-hint-box-free" style={{ marginTop: '8px' }}>
+                      <div className="unlocked-hint-header">
+                        <Lightbulb size={13} className="hint-bulb-icon" />
+                        <span className="hint-header-free">🎁 Free Starter Clue (0 pts deducted):</span>
+                      </div>
+                      <p className="unlocked-hint-text">{unlockedFreeHints[q.id]}</p>
+                    </div>
+                  )}
+
+                  {/* 2-Trial Paid Forensic Hint Section (remains accessible on this same question!) */}
+                  <div className="q-hint-control-row" style={{ marginTop: '8px' }}>
+                    {hasPaidHint ? (
+                      <div className="unlocked-hint-box">
+                        <div className="unlocked-hint-header">
+                          <Lightbulb size={13} className="hint-bulb-icon" />
+                          <span className="hint-header-paid">💡 Forensic Walkthrough (-15 pts deduction applied):</span>
+                        </div>
+                        <p className="unlocked-hint-text">{unlockedPaidHints[q.id]}</p>
+                      </div>
+                    ) : wrongCount >= 2 ? (
+                      <button
+                        type="button"
+                        className="btn-unlock-hint"
+                        onClick={() => handleUnlockPaidHint(q.id)}
+                      >
+                        <Lightbulb size={13} />
+                        <span>💡 Unlock Forensic Hint (-15 pts deduction)</span>
+                      </button>
+                    ) : (
+                      <div className="hint-locked-badge" title="Trainees must attempt at least 2 incorrect findings before hint unlocks">
+                        <Lock size={11} />
+                        <span>Forensic hint locked (Unlocks after 2 wrong attempts: {wrongCount}/2)</span>
+                      </div>
+                    )}
                   </div>
                 </div>
               )
             })}
+
+            {freeHintsUsed.length > 0 && (
+              <div className="hint-penalty-alert hint-free-notice">
+                <CheckCircle2 size={14} style={{ color: '#10b981', flexShrink: 0 }} />
+                <span>
+                  <strong>Free Hints Active:</strong> You used {freeHintsUsed.length} free hint(s) (<strong>0 points deducted</strong>).
+                </span>
+              </div>
+            )}
+
+            {hintsUsed.length > 0 && (
+              <div className="hint-penalty-alert">
+                <AlertTriangle size={14} style={{ flexShrink: 0 }} />
+                <span>
+                  <strong>Hint Penalty Notice:</strong> You unlocked {hintsUsed.length} forensic hint(s). A total deduction of <strong>{hintsUsed.length * 15} points</strong> will be subtracted from your final score.
+                </span>
+              </div>
+            )}
 
             <button type="submit" className="inv-submit-btn" disabled={submitting}>
               {submitting ? (
