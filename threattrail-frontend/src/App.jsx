@@ -1,13 +1,15 @@
 import { BrowserRouter, Routes, Route, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Shield, ShieldAlert, ShieldCheck, User, LogOut } from 'lucide-react'
+import { Shield, ShieldAlert, ShieldCheck, User, LogOut, Trophy, UserCircle } from 'lucide-react'
 import { AuthProvider, useAuth } from './context/AuthContext'
 import Dashboard from './pages/Dashboard'
 import Investigation from './pages/Investigation'
 import Report from './pages/Report'
 import Admin from './pages/Admin'
+import Leaderboard from './pages/Leaderboard'
 import Login from './pages/Login'
 import Register from './pages/Register'
 import AdminLogin from './pages/AdminLogin'
+import Profile from './pages/Profile'
 import AdminRoute from './components/AdminRoute'
 import ProtectedRoute from './components/ProtectedRoute'
 import './App.css'
@@ -44,6 +46,11 @@ function Header() {
           Dashboard
         </Link>
 
+        <Link to="/leaderboard" className={`app-nav-link ${loc.pathname === '/leaderboard' ? 'app-nav-active' : ''}`}>
+          <Trophy size={14} style={{ verticalAlign: 'middle', marginRight: '5px' }} />
+          Leaderboard
+        </Link>
+
         {/* ONLY ADMIN can see the Admin Panel link */}
         {isAdmin && (
           <Link
@@ -60,13 +67,25 @@ function Header() {
       <div className="app-header-auth">
         {isAuthenticated ? (
           <div className="app-user-profile">
-            <div className={`user-badge-pill ${isAdmin ? 'user-badge-admin' : 'user-badge-analyst'}`}>
+            <Link
+              to="/profile"
+              className={`user-badge-pill ${isAdmin ? 'user-badge-admin' : 'user-badge-analyst'} user-badge-clickable`}
+              title="View & edit your profile"
+            >
               <span className="user-icon">
                 {isAdmin ? <ShieldCheck size={14} /> : <User size={14} />}
               </span>
               <span className="user-name">{user.username}</span>
               <span className="user-role-tag">{isAdmin ? 'Admin' : 'Analyst'}</span>
-            </div>
+            </Link>
+            <Link
+              to="/profile"
+              className={`app-profile-btn ${loc.pathname === '/profile' ? 'app-profile-btn-active' : ''}`}
+              title="My Profile"
+            >
+              <UserCircle size={14} />
+              <span>Profile</span>
+            </Link>
             <button
               onClick={handleLogout}
               className="app-logout-btn"
@@ -106,6 +125,7 @@ function App() {
           <main className="app-main">
             <Routes>
               <Route path="/" element={<Dashboard />} />
+              <Route path="/leaderboard" element={<Leaderboard />} />
               <Route path="/login" element={<Login />} />
               <Route path="/register" element={<Register />} />
               <Route path="/admin/login" element={<AdminLogin />} />
@@ -130,6 +150,14 @@ function App() {
                 element={
                   <ProtectedRoute>
                     <Report />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="/profile"
+                element={
+                  <ProtectedRoute>
+                    <Profile />
                   </ProtectedRoute>
                 }
               />

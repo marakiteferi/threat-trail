@@ -2,7 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Query, st
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text
 import os
 import re
 import io
@@ -20,7 +20,10 @@ from schemas import (
     SubmissionRequest, SubmissionResponse, QuestionResult,
     ScenarioCreate, ScenarioUpdate, StatusUpdate, AlertCreate, QuestionCreate,
     ScenarioAdminOut, ScenarioAdminDetailOut, ScenarioFullCreate, ScenarioFullUpdate,
-    UserRegister, UserLogin, UserOut, AuthResponse,
+    UserRegister, UserLogin, UserOut, AuthResponse, UserProfileUpdate, UserProfileOut,
+    UserAdminOut, UserAdminCreate, UserAdminUpdateRole, UserAdminResetPassword,
+    VerifyFindingRequest, VerifyFindingResponse, HintResponse,
+    SubmissionAdminOut, LeaderboardUserOut,
 )
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -108,8 +111,55 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
 
 @app.on_event("startup")
 def on_startup():
-    """Create all tables if they don't already exist."""
+    """Create all tables and perform incremental column migrations if needed."""
     Base.metadata.create_all(bind=engine)
+    try:
+        with engine.connect() as conn:
+            if engine.dialect.name == "sqlite":
+                res_u = conn.execute(text("PRAGMA table_info(users);")).fetchall()
+                u_cols = [r[1] for r in res_u]
+                if "created_at" not in u_cols:
+                    conn.execute(text("ALTER TABLE users ADD COLUMN created_at DATETIME;"))
+                    conn.execute(text("UPDATE users SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL;"))
+                if "email" not in u_cols:
+                    conn.execute(text("ALTER TABLE users ADD COLUMN email VARCHAR(200);"))
+                if "avatar_color" not in u_cols:
+                    conn.execute(text("ALTER TABLE users ADD COLUMN avatar_color VARCHAR(20) DEFAULT '#3b82f6';"))
+
+                res_q = conn.execute(text("PRAGMA table_info(questions);")).fetchall()
+                q_cols = [r[1] for r in res_q]
+                if "hint" not in q_cols:
+                    conn.execute(text("ALTER TABLE questions ADD COLUMN hint TEXT;"))
+
+                res_ir = conn.execute(text("PRAGMA table_info(investigation_results);")).fetchall()
+                ir_cols = [r[1] for r in res_ir]
+                if "hints_used" not in ir_cols:
+                    conn.execute(text("ALTER TABLE investigation_results ADD COLUMN hints_used JSON;"))
+                if "free_hint_id" not in ir_cols:
+                    conn.execute(text("ALTER TABLE investigation_results ADD COLUMN free_hint_id INTEGER;"))
+                if "free_hints_used" not in ir_cols:
+                    conn.execute(text("ALTER TABLE investigation_results ADD COLUMN free_hints_used JSON;"))
+                if "trials_count" not in ir_cols:
+                    conn.execute(text("ALTER TABLE investigation_results ADD COLUMN trials_count INTEGER DEFAULT 1;"))
+                if "user_guesses" not in ir_cols:
+                    conn.execute(text("ALTER TABLE investigation_results ADD COLUMN user_guesses JSON;"))
+                if "submitted_at" not in ir_cols:
+                    conn.execute(text("ALTER TABLE investigation_results ADD COLUMN submitted_at DATETIME;"))
+                conn.commit()
+            elif engine.dialect.name == "postgresql":
+                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
+                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(200);"))
+                conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_color VARCHAR(20) DEFAULT '#3b82f6';"))
+                conn.execute(text("ALTER TABLE questions ADD COLUMN IF NOT EXISTS hint TEXT;"))
+                conn.execute(text("ALTER TABLE investigation_results ADD COLUMN IF NOT EXISTS hints_used JSONB;"))
+                conn.execute(text("ALTER TABLE investigation_results ADD COLUMN IF NOT EXISTS free_hint_id INTEGER;"))
+                conn.execute(text("ALTER TABLE investigation_results ADD COLUMN IF NOT EXISTS free_hints_used JSONB;"))
+                conn.execute(text("ALTER TABLE investigation_results ADD COLUMN IF NOT EXISTS trials_count INTEGER DEFAULT 1;"))
+                conn.execute(text("ALTER TABLE investigation_results ADD COLUMN IF NOT EXISTS user_guesses JSONB;"))
+                conn.execute(text("ALTER TABLE investigation_results ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
+                conn.commit()
+    except Exception as e:
+        print(f"[!] Schema check warning: {e}")
 
 
 # ── Auth Endpoints ────────────────────────────────────────────────────────────
@@ -185,6 +235,94 @@ def admin_login(body: UserLogin, db: Session = Depends(get_db)):
 @app.get("/api/auth/me", response_model=UserOut)
 def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@app.patch("/api/auth/profile", response_model=UserProfileOut)
+def update_profile(
+    body: UserProfileUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Allow an authenticated user to update their own profile (username, email, password, avatar color)."""
+    
+    # Update username if provided
+    if body.username is not None:
+        new_username = body.username.strip()
+        if len(new_username) < 3:
+            raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+        if not re.match(r"^[a-zA-Z0-9_\-\.]+$", new_username):
+            raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, hyphens, dots, and underscores")
+        if new_username.lower() != current_user.username.lower():
+            existing = db.query(User).filter(User.username.ilike(new_username)).first()
+            if existing:
+                raise HTTPException(status_code=400, detail="That username is already taken")
+        current_user.username = new_username
+    
+    # Update email if provided
+    if body.email is not None:
+        email = body.email.strip()
+        if email and not re.match(r'^[^@]+@[^@]+\.[^@]+$', email):
+            raise HTTPException(status_code=400, detail="Invalid email address format")
+        current_user.email = email if email else None
+    
+    # Update password if provided
+    if body.new_password is not None:
+        if not body.current_password:
+            raise HTTPException(status_code=400, detail="Current password is required to set a new password")
+        if len(body.new_password) < 4:
+            raise HTTPException(status_code=400, detail="New password must be at least 4 characters")
+        try:
+            valid = bcrypt.checkpw(body.current_password.encode("utf-8"), current_user.password_hash.encode("utf-8"))
+        except Exception:
+            valid = False
+        if not valid:
+            raise HTTPException(status_code=400, detail="Current password is incorrect")
+        current_user.password_hash = bcrypt.hashpw(body.new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    
+    # Update avatar color if provided
+    if body.avatar_color is not None:
+        if not re.match(r'^#[0-9A-Fa-f]{6}$', body.avatar_color):
+            raise HTTPException(status_code=400, detail="Invalid hex color format (e.g. #3b82f6)")
+        current_user.avatar_color = body.avatar_color
+    
+    db.commit()
+    db.refresh(current_user)
+    return current_user
+
+
+@app.get("/api/auth/profile/stats", response_model=dict)
+def get_profile_stats(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return current user's investigation stats for their profile page."""
+    results = db.query(InvestigationResult).filter(InvestigationResult.user_id == current_user.id).all()
+    total_investigations = len(results)
+    total_points = sum(r.points_earned for r in results)
+    avg_score = round(sum(r.score for r in results) / total_investigations) if total_investigations else 0
+    hints_used = sum(len(r.hints_used or []) for r in results)
+    scenarios_completed = len(set(r.scenario_id for r in results))
+    
+    recent = sorted(results, key=lambda r: r.submitted_at or datetime.min, reverse=True)[:5]
+    recent_out = []
+    for r in recent:
+        sc = db.query(Scenario).filter(Scenario.id == r.scenario_id).first()
+        recent_out.append({
+            "scenario_id": r.scenario_id,
+            "scenario_name": sc.name if sc else f"Scenario #{r.scenario_id}",
+            "score": r.score,
+            "points_earned": r.points_earned,
+            "submitted_at": r.submitted_at.isoformat() if r.submitted_at else None,
+        })
+    
+    return {
+        "total_investigations": total_investigations,
+        "total_points": total_points,
+        "average_score": avg_score,
+        "hints_used": hints_used,
+        "scenarios_completed": scenarios_completed,
+        "recent_activity": recent_out,
+    }
 
 
 # ── Trainee Endpoints ──────────────────────────────────────────────────────────
@@ -276,6 +414,52 @@ def is_answer_match(user_raw: str, correct_raw: str, aliases: Optional[list[str]
     return False
 
 
+@app.post("/api/scenarios/{scenario_id}/verify-finding", response_model=VerifyFindingResponse)
+def verify_finding(
+    scenario_id: int,
+    body: VerifyFindingRequest,
+    db: Session = Depends(get_db),
+):
+    question = db.query(Question).filter(Question.id == body.question_id, Question.scenario_id == scenario_id).first()
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    is_correct = is_answer_match(body.answer, question.correct_answer, question.acceptable_answers)
+    return VerifyFindingResponse(
+        question_id=question.id,
+        is_correct=is_correct,
+        message="Correct finding! Excellent analysis." if is_correct else "Incorrect finding. Inspect the logs more closely."
+    )
+
+
+@app.post("/api/scenarios/{scenario_id}/questions/{question_id}/hint", response_model=HintResponse)
+def get_question_hint(
+    scenario_id: int,
+    question_id: int,
+    is_free: bool = Query(False, description="Whether this hint is claimed using the free hint button"),
+    db: Session = Depends(get_db),
+):
+    question = db.query(Question).filter(Question.id == question_id, Question.scenario_id == scenario_id).first()
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    if is_free:
+        hint_text = question.hint or (
+            "Focus on the Event IDs related to this incident. Look at the suspicious IPs and verify timestamp order."
+        )
+    else:
+        hint_text = question.explanation or question.hint or (
+            "Cross-reference the relevant security event IDs with timestamps to identify the forensic artifact."
+        )
+
+    return HintResponse(
+        question_id=question.id,
+        hint=hint_text,
+        point_deduction=0 if is_free else 15,
+        is_free=is_free,
+    )
+
+
 @app.post("/api/scenarios/{scenario_id}/submit", response_model=SubmissionResponse)
 def submit_answers(
     scenario_id: int,
@@ -322,8 +506,17 @@ def submit_answers(
             )
         )
 
+    hints_used = body.hints_used or []
+    free_hints_used = body.free_hints_used or []
+    if body.free_hint_id and body.free_hint_id not in free_hints_used:
+        free_hints_used.append(body.free_hint_id)
+
+    # Paid forensic hints unlocked via the 2-trial button deduct 15 points each:
+    hint_penalty = len(hints_used) * 15
+    adjusted_points_earned = max(0, points_earned - hint_penalty)
+
     total = len(questions)
-    score_percent = round((points_earned / total_points) * 100) if total_points > 0 else (
+    score_percent = round((adjusted_points_earned / total_points) * 100) if total_points > 0 else (
         round((correct_count / total) * 100) if total > 0 else 0
     )
 
@@ -334,9 +527,15 @@ def submit_answers(
         user_id=resolved_user_id,
         scenario_id=scenario_id,
         score=score_percent,
-        points_earned=points_earned,
+        points_earned=adjusted_points_earned,
         total_points=total_points,
         pinned_log_ids=body.pinned_log_ids or [],
+        hints_used=hints_used,
+        free_hint_id=body.free_hint_id or (free_hints_used[0] if free_hints_used else None),
+        free_hints_used=free_hints_used,
+        trials_count=body.trials_count or 1,
+        user_guesses=body.user_guesses or {},
+        submitted_at=datetime.utcnow(),
     )
     db.add(result_record)
     db.commit()
@@ -353,10 +552,15 @@ def submit_answers(
         total_questions=total,
         correct_count=correct_count,
         total_points=total_points,
-        points_earned=points_earned,
+        points_earned=adjusted_points_earned,
         score_percent=score_percent,
         pinned_log_ids=body.pinned_log_ids or [],
         key_evidence_log_ids=key_log_ids,
+        hints_used=hints_used,
+        free_hint_id=body.free_hint_id or (free_hints_used[0] if free_hints_used else None),
+        free_hints_used=free_hints_used,
+        hint_penalty=hint_penalty,
+        trials_count=body.trials_count or 1,
         results=results,
     )
 
@@ -370,6 +574,9 @@ def get_admin_stats(db: Session = Depends(get_db), admin: User = Depends(require
     draft_scenarios = db.query(Scenario).filter(Scenario.status == "Draft").count()
     total_logs = db.query(Log).count()
     total_submissions = db.query(InvestigationResult).count()
+    total_users = db.query(User).count()
+    total_admins = db.query(User).filter(User.role == "admin").count()
+    total_trainees = db.query(User).filter(User.role == "user").count()
 
     return {
         "total_scenarios": total_scenarios,
@@ -377,7 +584,254 @@ def get_admin_stats(db: Session = Depends(get_db), admin: User = Depends(require
         "draft_scenarios": draft_scenarios,
         "total_logs": total_logs,
         "total_submissions": total_submissions,
+        "total_users": total_users,
+        "total_admins": total_admins,
+        "total_trainees": total_trainees,
     }
+
+
+@app.get("/api/admin/submissions", response_model=list[SubmissionAdminOut])
+def get_admin_submissions(
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    submissions = (
+        db.query(InvestigationResult)
+        .order_by(InvestigationResult.id.desc())
+        .limit(100)
+        .all()
+    )
+    out = []
+    for s in submissions:
+        user = s.user
+        scenario = s.scenario
+        hints = s.hints_used or []
+        free_hints = s.free_hints_used or []
+        if s.free_hint_id and s.free_hint_id not in free_hints:
+            free_hints.append(s.free_hint_id)
+        hint_penalty = len(hints) * 15
+        out.append(
+            SubmissionAdminOut(
+                id=s.id,
+                user_id=s.user_id,
+                username=user.username if user else f"User #{s.user_id}",
+                user_role=user.role if user else "user",
+                scenario_id=s.scenario_id,
+                scenario_name=scenario.name if scenario else f"Scenario #{s.scenario_id}",
+                mitre_technique=scenario.mitre_technique if scenario else "N/A",
+                score=s.score,
+                points_earned=s.points_earned,
+                total_points=s.total_points,
+                hints_used=hints,
+                free_hint_id=s.free_hint_id,
+                free_hints_used=free_hints,
+                hint_penalty=hint_penalty,
+                trials_count=s.trials_count or 1,
+                user_guesses=s.user_guesses or {},
+                submitted_at=s.submitted_at.isoformat() if s.submitted_at else None,
+            )
+        )
+    return out
+
+
+# ── Admin User Management Endpoints ──────────────────────────────────────────
+
+@app.get("/api/admin/users", response_model=list[UserAdminOut])
+def get_admin_users(
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """List all registered users, their registration date, submissions, and point totals."""
+    users = db.query(User).order_by(User.id.asc()).all()
+    results = db.query(InvestigationResult).all()
+
+    user_results: dict[int, list[InvestigationResult]] = {}
+    for r in results:
+        user_results.setdefault(r.user_id, []).append(r)
+
+    out = []
+    for u in users:
+        u_res = user_results.get(u.id, [])
+        subs_count = len(u_res)
+        tot_pts = sum(r.points_earned for r in u_res)
+        avg_score = round(sum(r.score for r in u_res) / subs_count) if subs_count else 0
+        out.append(
+            UserAdminOut(
+                id=u.id,
+                username=u.username,
+                role=u.role,
+                created_at=u.created_at,
+                submissions_count=subs_count,
+                total_points=tot_pts,
+                average_score=avg_score,
+            )
+        )
+    return out
+
+
+@app.post("/api/admin/users", response_model=UserAdminOut)
+def admin_create_user(
+    body: UserAdminCreate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin-controlled user creation (add a trainee or another admin)."""
+    username = body.username.strip()
+    if len(username) < 3:
+        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+    if len(body.password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    if not re.match(r"^[a-zA-Z0-9_\-\.]+$", username):
+        raise HTTPException(status_code=400, detail="Username can only contain letters, numbers, hyphens, and underscores")
+
+    existing = db.query(User).filter(User.username.ilike(username)).first()
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Username '{username}' is already registered")
+
+    role = body.role if body.role in ("admin", "user") else "user"
+    pw_hash = bcrypt.hashpw(body.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    new_user = User(
+        username=username,
+        password_hash=pw_hash,
+        role=role,
+        created_at=datetime.utcnow(),
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    return UserAdminOut(
+        id=new_user.id,
+        username=new_user.username,
+        role=new_user.role,
+        created_at=new_user.created_at,
+        submissions_count=0,
+        total_points=0,
+        average_score=0,
+    )
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin-controlled user deletion with self-deletion protection and cascade cleanup."""
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot delete your own active administrator account")
+
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Clean up investigation records first (if cascade isn't fully enforced)
+    db.query(InvestigationResult).filter(InvestigationResult.user_id == user_id).delete()
+    uname = target_user.username
+    db.delete(target_user)
+    db.commit()
+    return {"status": "success", "message": f"User '{uname}' and associated data deleted successfully"}
+
+
+@app.patch("/api/admin/users/{user_id}/role")
+def admin_update_user_role(
+    user_id: int,
+    body: UserAdminUpdateRole,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Promote trainee to admin or demote admin to trainee."""
+    if body.role not in ("admin", "user"):
+        raise HTTPException(status_code=400, detail="Role must be either 'admin' or 'user'")
+    if user_id == admin.id and body.role != "admin":
+        raise HTTPException(status_code=400, detail="Cannot demote your own active administrator account")
+
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    target_user.role = body.role
+    db.commit()
+    db.refresh(target_user)
+    return {"status": "success", "message": f"User '{target_user.username}' role changed to '{target_user.role}'", "role": target_user.role}
+
+
+@app.patch("/api/admin/users/{user_id}/password")
+def admin_reset_user_password(
+    user_id: int,
+    body: UserAdminResetPassword,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Admin password reset for any user."""
+    if len(body.password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+
+    target_user = db.query(User).filter(User.id == user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    pw_hash = bcrypt.hashpw(body.password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+    target_user.password_hash = pw_hash
+    db.commit()
+    return {"status": "success", "message": f"Password successfully reset for '{target_user.username}'"}
+
+
+
+# ── Leaderboard Endpoint ──────────────────────────────────────────────────────
+
+@app.get("/api/leaderboard", response_model=list[LeaderboardUserOut])
+def get_leaderboard(db: Session = Depends(get_db)):
+    users = db.query(User).all()
+    results = db.query(InvestigationResult).all()
+
+    user_results = {}
+    for r in results:
+        user_results.setdefault(r.user_id, []).append(r)
+
+    leaderboard = []
+    for u in users:
+        u_res = user_results.get(u.id, [])
+        total_points = sum(r.points_earned for r in u_res)
+        scenarios_completed = len(set(r.scenario_id for r in u_res))
+        avg_score = round(sum(r.score for r in u_res) / len(u_res)) if u_res else 0
+        total_trials = sum(r.trials_count or 1 for r in u_res)
+        hints_used_count = sum(len(r.hints_used or []) for r in u_res)
+
+        if total_points >= 200:
+            status = "Principal SOC Lead"
+            badge = "🏆"
+        elif total_points >= 120:
+            status = "Senior Threat Hunter"
+            badge = "🛡️"
+        elif total_points >= 50:
+            status = "Incident Responder"
+            badge = "🔍"
+        else:
+            status = "Junior Analyst"
+            badge = "🔰"
+
+        leaderboard.append({
+            "user_id": u.id,
+            "username": u.username,
+            "role": u.role,
+            "total_points": total_points,
+            "scenarios_completed": scenarios_completed,
+            "average_score": avg_score,
+            "total_trials": total_trials,
+            "hints_used_count": hints_used_count,
+            "status": status,
+            "badge": badge,
+        })
+
+    leaderboard.sort(key=lambda x: (x["total_points"], x["scenarios_completed"], x["average_score"]), reverse=True)
+
+    ranked_out = []
+    for idx, entry in enumerate(leaderboard, start=1):
+        entry["rank"] = idx
+        ranked_out.append(LeaderboardUserOut(**entry))
+
+    return ranked_out
 
 
 @app.get("/api/admin/scenarios", response_model=list[ScenarioAdminOut])

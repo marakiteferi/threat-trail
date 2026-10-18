@@ -1,8 +1,9 @@
-import { useLocation, useParams, Link } from 'react-router-dom'
+import { useLocation, useParams, Link, useNavigate } from 'react-router-dom'
 
 export default function Report() {
   const { scenarioId } = useParams()
   const location = useLocation()
+  const navigate = useNavigate()
 
   const stored = sessionStorage.getItem(`report_${scenarioId}`)
   const report = location.state?.report || (stored ? JSON.parse(stored) : null)
@@ -146,11 +147,18 @@ export default function Report() {
       </div>
 
       <div className="rpt-actions">
-        <Link to="/" className="rpt-btn-back">
-          ← Back to Scenarios
-        </Link>
+        <button
+          className="rpt-btn-back"
+          onClick={() => navigate(-1)}
+          title="Go back to previous page"
+        >
+          ← Back
+        </button>
         <Link to={`/investigate/${scenarioId}`} className="rpt-btn-retry">
           ↻ Re-Investigate Scenario
+        </Link>
+        <Link to="/" className="rpt-btn-back" style={{ marginLeft: 'auto' }}>
+          Dashboard
         </Link>
       </div>
     </div>

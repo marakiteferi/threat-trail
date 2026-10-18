@@ -16,6 +16,11 @@ import {
   Inbox,
   Shield,
   Crosshair,
+  Info,
+  ChevronDown,
+  ChevronUp,
+  Terminal,
+  BookOpen,
 } from 'lucide-react'
 import api from '../api'
 import { useAuth } from '../context/AuthContext'
@@ -125,6 +130,95 @@ function ScenarioCard({ scenario, index, isAuthenticated }) {
   )
 }
 
+function PlatformGuide() {
+  const [showFaq, setShowFaq] = useState(false)
+
+  return (
+    <div className="db-guide-box">
+      <div className="db-guide-top">
+        <div className="db-guide-badge">
+          <Info size={14} />
+          <span>How ThreatTrail Works</span>
+        </div>
+        <button
+          type="button"
+          className="db-guide-toggle-btn"
+          onClick={() => setShowFaq(v => !v)}
+          title="Toggle Event ID and log explanation"
+        >
+          <span>{showFaq ? 'Hide Log Guide' : 'What are Event IDs?'}</span>
+          {showFaq ? <ChevronUp size={14} /> : <ChevronDown size={14} />}
+        </button>
+      </div>
+
+      <div className="db-guide-intro">
+        <h2 className="db-guide-title">Hands-On Active Directory SOC Investigation Platform</h2>
+        <p className="db-guide-desc">
+          ThreatTrail simulates the daily workflow of a Security Operations Center (SOC) analyst.
+          Instead of multiple-choice theory quizzes, you investigate authentic recorded <strong>Windows Event Logs</strong> and <strong>Sysmon telemetry</strong> from real Active Directory cyberattacks.
+        </p>
+      </div>
+
+      <div className="db-guide-steps">
+        <div className="db-guide-step">
+          <div className="db-guide-step-badge">Step 1</div>
+          <div className="db-guide-step-body">
+            <h4>Select an Attack Scenario</h4>
+            <p>Choose an incident from the dashboard below to review the triggered alert, severity level, and Active Directory environment details.</p>
+          </div>
+        </div>
+
+        <div className="db-guide-step">
+          <div className="db-guide-step-badge">Step 2</div>
+          <div className="db-guide-step-body">
+            <h4>Analyze Event Logs</h4>
+            <p>Filter and inspect recorded Windows security logs. Correlate timestamps, usernames, and source IPs to trace the threat actor's activity.</p>
+          </div>
+        </div>
+
+        <div className="db-guide-step">
+          <div className="db-guide-step-badge">Step 3</div>
+          <div className="db-guide-step-body">
+            <h4>Solve & Submit Answers</h4>
+            <p>Identify the attacker's IP, compromised accounts, and MITRE ATT&CK techniques. Submit your forensic findings to get your score!</p>
+          </div>
+        </div>
+      </div>
+
+      {showFaq && (
+        <div className="db-guide-faq">
+          <div className="db-faq-card">
+            <div className="db-faq-header">
+              <HelpCircle size={16} className="faq-icon-blue" />
+              <strong>Why are some Event IDs the same in the log viewer?</strong>
+            </div>
+            <p>
+              In Windows Security logging, an <strong>Event ID is a standardized category code</strong> (like an HTTP status code), not a unique row ID.
+              For example, <code>Event 4625</code> indicates a Failed Logon. If an attacker runs a password spray against 15 accounts, Windows logs 15 separate <code>4625</code> events.
+              To differentiate them, look at the <strong>Timestamp</strong>, <strong>Username</strong>, <strong>Source IP</strong>, and <strong>Failure Reason (SubStatus)</strong>.
+            </p>
+          </div>
+
+          <div className="db-faq-card">
+            <div className="db-faq-header">
+              <Terminal size={16} className="faq-icon-green" />
+              <strong>Common Event IDs you will encounter:</strong>
+            </div>
+            <div className="db-faq-tags">
+              <span className="faq-tag"><code>4625</code> Failed Logon</span>
+              <span className="faq-tag"><code>4624</code> Successful Logon</span>
+              <span className="faq-tag"><code>4768</code> Kerberos TGT</span>
+              <span className="faq-tag"><code>4769</code> Kerberos TGS (RC4 / Kerberoast)</span>
+              <span className="faq-tag"><code>4662</code> AD Object Access (DCSync)</span>
+              <span className="faq-tag"><code>4688</code> Process Creation</span>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export default function Dashboard() {
   const [scenarios, setScenarios] = useState([])
   const [loading, setLoading] = useState(true)
@@ -189,6 +283,9 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+
+      {/* Platform Explainer Guide */}
+      <PlatformGuide />
 
       {/* Scenario Grid */}
       {scenarios.length === 0 ? (
