@@ -6,3 +6,4 @@ pydantic
 python-multipart
 bcrypt
 python-jose[cryptography]
+python-dotenv

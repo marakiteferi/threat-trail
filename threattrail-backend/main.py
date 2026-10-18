@@ -358,30 +358,23 @@ def get_scenario_alert(scenario_id: int, db: Session = Depends(get_db)):
 def get_scenario_logs(
     scenario_id: int,
     event_id: Optional[int] = Query(None, description="Filter by Windows Event ID"),
-    search: Optional[str] = Query(None, description="Search username, IP, host, or raw event data"),
-    key_evidence_only: bool = Query(False, description="Return only key evidence logs"),
-    limit: int = Query(2000, ge=1, le=10000),
+    search: Optional[str] = Query(None, description="Search username, IP, or host"),
+    limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ):
-    from sqlalchemy import cast, String as SAString
     query = db.query(Log).filter(Log.scenario_id == scenario_id)
     if event_id is not None:
         query = query.filter(Log.event_id == event_id)
-    if key_evidence_only:
-        query = query.filter(Log.is_key_evidence == True)
     if search:
         term = f"%{search.strip()}%"
-        # Search structured columns + the full raw JSON text (cast to string)
         query = query.filter(
             (Log.username.ilike(term))
             | (Log.source_ip.ilike(term))
             | (Log.target_host.ilike(term))
-            | (cast(Log.raw_event_data, SAString).ilike(term))
         )
-    # Key evidence rows bubble up first, then chronological order
-    logs = query.order_by(Log.is_key_evidence.desc(), Log.timestamp).offset(offset).limit(limit).all()
-    if not logs and offset == 0 and event_id is None and not search and not key_evidence_only:
+    logs = query.order_by(Log.timestamp).offset(offset).limit(limit).all()
+    if not logs and offset == 0 and event_id is None and not search:
         raise HTTPException(status_code=404, detail="No logs found for this scenario")
     return logs
 
