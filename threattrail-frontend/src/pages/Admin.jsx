@@ -72,6 +72,10 @@ export default function Admin() {
   const [editAlertTitle, setEditAlertTitle] = useState('')
   const [editAlertSeverity, setEditAlertSeverity] = useState('High')
   const [editSigmaRule, setEditSigmaRule] = useState('')
+  const [createAdContext, setCreateAdContext] = useState('{}')
+  const [isAnalyzingZip, setIsAnalyzingZip] = useState(false)
+  const [zipAnalysisReport, setZipAnalysisReport] = useState(null)
+  const [editAdContext, setEditAdContext] = useState('{}')
   const [editQuestions, setEditQuestions] = useState([])
   const [editFile, setEditFile] = useState(null)
   const [isSavingEdit, setIsSavingEdit] = useState(false)
@@ -296,6 +300,55 @@ export default function Admin() {
     }
   }
 
+  const handleAnalyzeZipFile = async (selectedFile) => {
+    const fileToAnalyze = selectedFile || createFile
+    if (!fileToAnalyze) {
+      showToast('Please select a .zip log archive first.', 'error')
+      return
+    }
+    setIsAnalyzingZip(true)
+    setCreateError('')
+    try {
+      const formData = new FormData()
+      formData.append('file', fileToAnalyze)
+      const res = await api.post('/admin/analyze-zip', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      })
+      const data = res.data
+      const draft = data.draft
+
+      setZipAnalysisReport(data)
+      setCreateName(draft.name || '')
+      setCreateDesc(draft.description || '')
+      setCreateMitre(draft.mitre_technique || '')
+      setCreateStatus(draft.status || 'Draft')
+      setCreateAlertTitle(draft.alert_title || '')
+      setCreateAlertSeverity(draft.alert_severity || 'High')
+      setCreateSigmaRule(draft.sigma_rule || '')
+      setCreateAdContext(JSON.stringify(draft.ad_context || {}, null, 2))
+
+      if (draft.questions && draft.questions.length > 0) {
+        setCreateQuestions(
+          draft.questions.map((q) => ({
+            q: q.question_text,
+            a: q.correct_answer,
+            acceptable_answers: q.acceptable_answers || [],
+            explanation: q.explanation || '',
+            points: q.points || 10,
+          }))
+        )
+      }
+      showToast(
+        `Analyzed ${data.total_events_in_archive.toLocaleString()} events! Review the draft below before saving.`
+      )
+    } catch (err) {
+      setCreateError(err.response?.data?.detail || 'Failed to analyze ZIP archive')
+      showToast(err.response?.data?.detail || 'ZIP analysis failed', 'error')
+    } finally {
+      setIsAnalyzingZip(false)
+    }
+  }
+
   // ATOMIC SCENARIO CREATION
   const handleCreateSubmit = async (e) => {
     e.preventDefault()
@@ -305,11 +358,19 @@ export default function Admin() {
 
     try {
       setSubmitStep('Step 1/2: Atomically creating scenario, alert, Sigma rule, and questions...')
+      let parsedAdContext = {}
+      try {
+        parsedAdContext = createAdContext.trim() ? JSON.parse(createAdContext) : {}
+      } catch {
+        throw new Error('Observed AD Environment JSON is not valid JSON.')
+      }
+
       const validQuestions = createQuestions
         .filter((q) => q.q.trim() && q.a.trim())
         .map((q) => ({
           question_text: q.q.trim(),
           correct_answer: q.a.trim(),
+          acceptable_answers: q.acceptable_answers || [],
           explanation: q.explanation?.trim() || null,
           points: parseInt(q.points) || 10,
         }))
@@ -322,6 +383,7 @@ export default function Admin() {
         alert_title: createAlertTitle || `Detection Alert: ${createName}`,
         alert_severity: createAlertSeverity,
         sigma_rule: createSigmaRule.trim() || null,
+        ad_context: parsedAdContext,
         questions: validQuestions,
       })
 
@@ -358,6 +420,8 @@ export default function Admin() {
       setCreateAlertTitle('')
       setCreateAlertSeverity('High')
       setCreateSigmaRule('')
+      setCreateAdContext('{}')
+      setZipAnalysisReport(null)
       setCreateQuestions([{ q: '', a: '', explanation: '', points: 10 }])
       setCreateFile(null)
 
@@ -386,15 +450,17 @@ export default function Admin() {
       setEditAlertTitle(detail.alert ? detail.alert.title : '')
       setEditAlertSeverity(detail.alert ? detail.alert.severity : 'High')
       setEditSigmaRule(detail.alert?.sigma_rule || '')
+      setEditAdContext(JSON.stringify(detail.ad_context || {}, null, 2))
       setEditQuestions(
         detail.questions && detail.questions.length > 0
           ? detail.questions.map((q) => ({
               question_text: q.question_text,
               correct_answer: q.correct_answer,
+              acceptable_answers: q.acceptable_answers || [],
               explanation: q.explanation || '',
               points: q.points ?? 10,
             }))
-          : [{ question_text: '', correct_answer: '', explanation: '', points: 10 }]
+          : [{ question_text: '', correct_answer: '', acceptable_answers: [], explanation: '', points: 10 }]
       )
     } catch (err) {
       showToast(`Failed to load scenario details: ${err.message}`, 'error')
@@ -408,6 +474,13 @@ export default function Admin() {
     setEditError('')
 
     try {
+      let parsedEditAdContext = {}
+      try {
+        parsedEditAdContext = editAdContext.trim() ? JSON.parse(editAdContext) : {}
+      } catch {
+        throw new Error('Observed AD Environment JSON is not valid JSON.')
+      }
+
       const payload = {
         name: editName,
         description: editDesc,
@@ -416,11 +489,13 @@ export default function Admin() {
         alert_title: editAlertTitle,
         alert_severity: editAlertSeverity,
         sigma_rule: editSigmaRule.trim() || null,
+        ad_context: parsedEditAdContext,
         questions: editQuestions
           .filter((q) => q.question_text.trim() && q.correct_answer.trim())
           .map((q) => ({
             question_text: q.question_text,
             correct_answer: q.correct_answer,
+            acceptable_answers: q.acceptable_answers || [],
             explanation: q.explanation?.trim() || null,
             points: parseInt(q.points) || 10,
           })),
@@ -732,6 +807,63 @@ export default function Admin() {
           )}
 
           <form onSubmit={handleCreateSubmit}>
+            {/* STEP 0: EVIDENCE-DRIVEN ZIP AUTO-ANALYZER */}
+            <div className="form-section-card" style={{ borderColor: 'rgba(0, 255, 204, 0.35)' }}>
+              <div className="section-title">
+                <span className="step-num" style={{ background: '#00ffcc', color: '#0f172a' }}>⚡</span>
+                <div>
+                  <h4>Evidence-Driven .ZIP Log Analyzer & Draft Generator</h4>
+                  <p style={{ fontSize: '0.82rem', color: 'var(--text-dim)', margin: 0 }}>
+                    Upload a Windows Event / Sysmon .zip archive to scan 100% of events, extract observed Active Directory telemetry, and auto-populate an evidence-backed scenario draft for your review.
+                  </p>
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
+                <input
+                  type="file"
+                  accept=".zip"
+                  onChange={(e) => {
+                    const f = e.target.files[0] || null
+                    setCreateFile(f)
+                    setZipAnalysisReport(null)
+                    if (f) handleAnalyzeZipFile(f)
+                  }}
+                />
+                <button
+                  type="button"
+                  className="btn btn-primary btn-sm"
+                  disabled={!createFile || isAnalyzingZip}
+                  onClick={() => handleAnalyzeZipFile(createFile)}
+                >
+                  {isAnalyzingZip ? 'Scanning Entire Archive...' : '⚡ Analyze .ZIP & Populate Draft'}
+                </button>
+              </div>
+
+              {zipAnalysisReport && (
+                <div style={{ marginTop: 14, padding: 14, background: 'rgba(15, 23, 42, 0.75)', borderRadius: 8, border: '1px solid rgba(56, 189, 248, 0.3)' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+                    <strong style={{ color: '#38bdf8' }}>
+                      📊 Telemetry Report: {zipAnalysisReport.total_events_in_archive.toLocaleString()} total events analyzed → {zipAnalysisReport.curated_events_count} curated ({zipAnalysisReport.key_evidence_count} key evidence)
+                    </strong>
+                    <span className="status-pill status-published" style={{ fontSize: '0.75rem' }}>
+                      {zipAnalysisReport.confidence}
+                    </span>
+                  </div>
+                  <ul style={{ margin: '6px 0', paddingLeft: 18, fontSize: '0.83rem', color: '#e2e8f0' }}>
+                    {zipAnalysisReport.evidence_summary.map((item, i) => (
+                      <li key={i}>{item}</li>
+                    ))}
+                  </ul>
+                  {zipAnalysisReport.caveats?.length > 0 && (
+                    <div style={{ marginTop: 8, fontSize: '0.8rem', color: '#fbbf24' }}>
+                      <strong>⚠️ Analyst Review Note:</strong> {zipAnalysisReport.caveats.join(' ')}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
             <div className="form-section-card">
               <div className="section-title">
                 <span className="step-num">1</span>
@@ -821,6 +953,16 @@ export default function Admin() {
                   value={createSigmaRule}
                   onChange={(e) => setCreateSigmaRule(e.target.value)}
                   placeholder="title: Suspicious Activity&#10;detection:&#10;  selection:&#10;    EventID: 4624"
+                />
+              </div>
+              <div className="form-field" style={{ marginTop: 12 }}>
+                <label>Observed Active Directory & Telemetry Context JSON (Auto-extracted from logs — editable)</label>
+                <textarea
+                  className="admin-input"
+                  rows={6}
+                  style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}
+                  value={createAdContext}
+                  onChange={(e) => setCreateAdContext(e.target.value)}
                 />
               </div>
             </div>
@@ -1372,6 +1514,16 @@ export default function Admin() {
                     style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}
                     value={editSigmaRule}
                     onChange={(e) => setEditSigmaRule(e.target.value)}
+                  />
+                </div>
+                <div className="form-field" style={{ marginTop: 12 }}>
+                  <label>Observed Active Directory & Telemetry Context JSON (editable)</label>
+                  <textarea
+                    className="admin-input"
+                    rows={6}
+                    style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}
+                    value={editAdContext}
+                    onChange={(e) => setEditAdContext(e.target.value)}
                   />
                 </div>
 

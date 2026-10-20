@@ -25,6 +25,8 @@ from schemas import (
     VerifyFindingRequest, VerifyFindingResponse, HintResponse,
     SubmissionAdminOut, LeaderboardUserOut,
 )
+from zip_analyzer import analyze_zip_archive, extract_field_from_message
+
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
@@ -1204,31 +1206,36 @@ def create_question(scenario_id: int, body: QuestionCreate, db: Session = Depend
     return question
 
 
-def extract_field_from_message(msg: str, pattern: str) -> Optional[str]:
+@app.post("/api/admin/analyze-zip")
+async def analyze_zip_endpoint(
+    file: UploadFile = File(...),
+    admin: User = Depends(require_admin),
+):
     """
-    Extracts key values from Windows Security event Message text.
-    Uses re.findall and picks the last valid non-placeholder match so events like
-    4624/4625 (which have two 'Account Name:' lines: Subject '-' and Target 'user')
-    return the actual target account instead of '-'.
+    Streams and analyzes 100% of events in an uploaded .zip archive, returning
+    confidence-scored findings, observed AD context, and evidence-backed draft questions
+    for Admin review before saving.
     """
-    if not msg:
-        return None
-    matches = re.findall(pattern, msg, re.IGNORECASE)
-    valid = [m.strip() for m in matches if m and m.strip() not in ("-", "")]
-    return valid[-1] if valid else None
+    if not file.filename or not file.filename.lower().endswith(".zip"):
+        raise HTTPException(status_code=400, detail="Only .zip archives are supported")
 
-
-PRIORITY_EVENT_IDS = {
-    4624, 4625, 4648, 4662, 4672, 4688, 4697, 4698, 4768, 4769, 5140, 5145, 7045,
-    4103, 4104, 1, 3, 7, 8, 10, 11, 13, 17, 18, 22
-}
+    content = await file.read()
+    try:
+        report = analyze_zip_archive(content, target_sample_count=350)
+        # Exclude raw curated_events array from the lightweight form-preview response
+        return {k: v for k, v in report.items() if k != "curated_events"}
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid or corrupted .zip archive")
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ZIP analysis failed: {str(e)}")
 
 
 @app.post("/api/admin/scenarios/{scenario_id}/upload-logs")
 async def upload_logs(
     scenario_id: int,
     file: UploadFile = File(...),
-    target_count: int = Query(500, ge=50, le=2000, description="Target log count for smart signal preservation"),
     db: Session = Depends(get_db),
     admin: User = Depends(require_admin),
 ):
@@ -1236,208 +1243,50 @@ async def upload_logs(
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
-    if not file.filename.endswith('.zip'):
+    if not file.filename or not file.filename.lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are supported")
 
-    # Safety: limit upload to 200 MB to prevent OOM
-    MAX_UPLOAD_BYTES = 200 * 1024 * 1024
-    MAX_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
-
-    content = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="ZIP file exceeds the 200 MB upload limit")
-
-    alert = db.query(Alert).filter(Alert.scenario_id == scenario_id).first()
-
-    def _is_key_candidate(d: dict, ev: int) -> bool:
-        if alert:
-            rule = (alert.sigma_rule or "").lower()
-            title = (alert.title or "").lower()
-            target_evs = [int(m) for m in re.findall(r"event(?:id)?[:\s]+(\d+)", rule + " " + title)]
-            if target_evs and ev in target_evs:
-                # If specific keywords are in the rule, ensure at least one is present in data
-                keywords = [w.strip(" '\"") for w in re.findall(r"['\"]([^'\"]{4,})['\"]", rule)]
-                if not keywords:
-                    return True
-                d_str = json.dumps(d).lower()
-                return any(kw in d_str for kw in keywords)
-        return False
-
-    all_raw: list[dict] = []
-
+    content = await file.read()
     try:
-        with zipfile.ZipFile(io.BytesIO(content)) as zf:
-            total_uncompressed = sum(info.file_size for info in zf.infolist())
-            if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
-                raise HTTPException(status_code=413, detail="Uncompressed ZIP archive exceeds the 250 MB size limit")
+        analysis = analyze_zip_archive(content, target_sample_count=350)
+        curated_events = analysis["curated_events"]
 
-            for info in zf.infolist():
-                if info.filename.endswith(".json") or info.filename.endswith(".jsonl"):
-                    with zf.open(info) as f:
-                        for raw_line in f:
-                            line = raw_line.decode("utf-8", errors="replace").strip()
-                            if not line:
-                                continue
-                            if line.startswith("[") and line.endswith("]"):
-                                try:
-                                    arr = json.loads(line)
-                                    if isinstance(arr, list):
-                                        all_raw.extend([x for x in arr if isinstance(x, dict)])
-                                except Exception:
-                                    pass
-                                continue
-                            try:
-                                item = json.loads(line.rstrip(","))
-                                if isinstance(item, dict):
-                                    all_raw.append(item)
-                                elif isinstance(item, list):
-                                    all_raw.extend([x for x in item if isinstance(x, dict)])
-                            except Exception:
-                                continue
-                    if all_raw:
-                        break
-
-        total_in_zip = len(all_raw)
-        if total_in_zip == 0:
-            raise HTTPException(status_code=400, detail="No valid JSON / JSONL event logs found in the archive")
-
-        # Smart Curation: sample noisy captures while preserving 100% of attack key evidence
-        if total_in_zip <= target_count:
-            selected_raw = all_raw
-        else:
-            key_records = []
-            priority_records = []
-            background_records = []
-            for idx, d in enumerate(all_raw):
-                ev = d.get("EventID") or d.get("event_id") or 0
-                if isinstance(ev, dict):
-                    ev = ev.get("$numberInt") or 0
-                try:
-                    ev = int(ev)
-                except Exception:
-                    ev = 0
-
-                if _is_key_candidate(d, ev):
-                    key_records.append((idx, d))
-                elif ev in PRIORITY_EVENT_IDS:
-                    priority_records.append((idx, d))
-                else:
-                    background_records.append((idx, d))
-
-            max_priority = max(0, int(target_count * 0.75) - len(key_records))
-            if len(priority_records) > max_priority and max_priority > 0:
-                step = max(1, len(priority_records) // max_priority)
-                chosen_priority = priority_records[::step][:max_priority]
-            else:
-                chosen_priority = priority_records[:max_priority]
-
-            remaining_slots = max(0, target_count - len(key_records) - len(chosen_priority))
-            if remaining_slots > 0 and background_records:
-                step_bg = max(1, len(background_records) // remaining_slots)
-                chosen_bg = background_records[::step_bg][:remaining_slots]
-            else:
-                chosen_bg = []
-
-            combined = sorted(key_records + chosen_priority + chosen_bg, key=lambda x: x[0])
-            selected_raw = [x[1] for x in combined]
-
-        _IP_PLACEHOLDERS = {"-", "", "::1", "127.0.0.1", "0.0.0.0", "::"}
-
-        def _clean_ip(val):
-            if not val or str(val).strip() in _IP_PLACEHOLDERS:
-                return None
-            v = str(val).strip()
-            if v.lower().startswith("fe80"):
-                return None
-            return v
-
-        log_entries = []
-        for data in selected_raw:
-            ts_str = (
-                data.get('TimeCreated')
-                or data.get('@timestamp')
-                or data.get('EventTime')
-                or data.get('UtcTime')
-                or datetime.now().isoformat()
-            )
-            try:
-                if 'T' in str(ts_str):
-                    clean_ts = str(ts_str).replace('Z', '+00:00')
-                    ts = datetime.fromisoformat(clean_ts).replace(tzinfo=None)
-                else:
-                    ts = datetime.strptime(str(ts_str)[:19], "%Y-%m-%d %H:%M:%S")
-            except Exception:
-                ts = datetime.now()
-
-            event_id_raw = data.get('EventID') or data.get('event_id') or 0
-            if isinstance(event_id_raw, dict):
-                event_id_raw = event_id_raw.get('$numberInt') or 0
-            try:
-                event_id = int(event_id_raw)
-            except Exception:
-                event_id = 0
-
-            msg = data.get('Message') or ""
-
-            source_ip = (
-                _clean_ip(data.get('SourceAddress'))
-                or _clean_ip(data.get('IpAddress'))
-                or _clean_ip(data.get('SourceIp'))
-                or _clean_ip(data.get('SourceNetworkAddress'))
-                or _clean_ip(extract_field_from_message(msg, r"Source Network Address:\s*([^\r\n\t]+)"))
-                or _clean_ip(extract_field_from_message(msg, r"Source Address:\s*([^\r\n\t]+)"))
-                or _clean_ip(extract_field_from_message(msg, r"Client Address:\s*([^\r\n\t]+)"))
-            )
-
-            username = (
-                data.get('TargetUserName')
-                or data.get('AccountName')
-                or data.get('SubjectUserName')
-                or data.get('TargetUser')
-                or extract_field_from_message(msg, r"Account Name:\s*([^\r\n\t]+)")
-                or extract_field_from_message(msg, r"Target Account:\s*([^\r\n\t]+)")
-            )
-
-            target_host = (
-                data.get('Hostname')
-                or data.get('Computer')
-                or data.get('host')
-                or data.get('Workstation')
-                or extract_field_from_message(msg, r"Workstation Name:\s*([^\r\n\t]+)")
-            )
-
-            is_key = _is_key_candidate(data, event_id)
-
-            log_entries.append(Log(
+        log_entries = [
+            Log(
                 scenario_id=scenario_id,
-                event_id=event_id,
-                timestamp=ts,
-                source_ip=source_ip,
-                username=username,
-                target_host=target_host,
-                is_key_evidence=is_key,
-                raw_event_data=data
-            ))
+                event_id=ev["event_id"],
+                timestamp=ev["timestamp"],
+                source_ip=ev["source_ip"],
+                username=ev["username"],
+                target_host=ev["target_host"],
+                is_key_evidence=bool(ev.get("is_key_evidence", False)),
+                raw_event_data=ev["raw"],
+            )
+            for ev in curated_events
+        ]
 
-        log_entries.sort(key=lambda x: x.timestamp)
+        # If scenario had no ad_context yet, populate it with observed telemetry
+        if not scenario.ad_context:
+            scenario.ad_context = analysis["draft"]["ad_context"]
 
         db.query(Log).filter(Log.scenario_id == scenario_id).delete()
         db.add_all(log_entries)
         db.commit()
 
-        key_count = sum(1 for l in log_entries if l.is_key_evidence)
         return {
             "status": "success",
+            "total_in_archive": analysis["total_events_in_archive"],
             "logs_inserted": len(log_entries),
-            "total_in_archive": total_in_zip,
-            "key_evidence_count": key_count,
-            "message": f"Successfully ingested {len(log_entries)} Windows Event logs ({key_count} key evidence) from {total_in_zip} events in archive."
+            "key_evidence_count": analysis["key_evidence_count"],
+            "message": (
+                f"Analyzed {analysis['total_events_in_archive']} total events and curated "
+                f"{len(log_entries)} logs ({analysis['key_evidence_count']} key evidence events preserved)."
+            ),
         }
-
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid zip file format")
-    except HTTPException:
-        raise
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Log ingestion error: {str(e)}")
