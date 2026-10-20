@@ -338,11 +338,29 @@ export default function Investigation() {
 
   const handleAnswerChange = (qId, val) => {
     setAnswers((prev) => ({ ...prev, [qId]: val }))
+    // Clear stale verification message when the analyst edits their answer
+    if (verifyStatus[qId]) {
+      setVerifyStatus((prev) => {
+        const next = { ...prev }
+        delete next[qId]
+        return next
+      })
+    }
   }
 
   const handleVerifyFinding = async (questionId) => {
     const answer = (answers[questionId] || '').trim()
-    if (!answer) return
+    if (!answer) {
+      setVerifyStatus((prev) => ({
+        ...prev,
+        [questionId]: {
+          correct: false,
+          trap: false,
+          message: 'Please enter a finding before clicking Verify.',
+        },
+      }))
+      return
+    }
 
     setVerifyingId(questionId)
     try {
@@ -350,30 +368,47 @@ export default function Investigation() {
         question_id: questionId,
         answer: answer,
       })
-      const isCorrect = res.data.is_correct
+      const isCorrect = Boolean(res.data?.is_correct ?? res.data?.correct)
+      const isTrap = Boolean(res.data?.trap_detected)
+      const feedbackMsg =
+        res.data?.message ||
+        (isCorrect
+          ? 'Verified! Your finding matches the forensic evidence.'
+          : 'Incorrect finding. Re-check the Log Inspector fields or use a hint.')
 
-      // Record guess in questionGuesses
-      setQuestionGuesses(prev => ({
+      setQuestionGuesses((prev) => ({
         ...prev,
-        [questionId]: [...(prev[questionId] || []), answer]
+        [questionId]: [...(prev[questionId] || []), answer],
       }))
 
       if (!isCorrect) {
-        setTrialsCount(prev => ({
+        setTrialsCount((prev) => ({
           ...prev,
-          [questionId]: (prev[questionId] || 0) + 1
+          [questionId]: (prev[questionId] || 0) + 1,
         }))
       }
 
-      setVerifyStatus(prev => ({
+      setVerifyStatus((prev) => ({
         ...prev,
         [questionId]: {
           correct: isCorrect,
-          message: res.data.message
-        }
+          trap: isTrap,
+          message: feedbackMsg,
+        },
       }))
     } catch (err) {
-      console.error('Failed to verify finding:', err)
+      const errMsg =
+        err.response?.data?.detail ||
+        err.message ||
+        'Verification request failed. Check that the backend server is running.'
+      setVerifyStatus((prev) => ({
+        ...prev,
+        [questionId]: {
+          correct: false,
+          trap: false,
+          message: `⚠️ Verification Error: ${errMsg}`,
+        },
+      }))
     } finally {
       setVerifyingId(null)
     }
@@ -1352,10 +1387,10 @@ export default function Investigation() {
 
                   {/* Verification message / error badge */}
                   {status && (
-                    <div className={`verify-feedback-msg ${status.correct ? 'msg-success' : 'msg-error'}`}>
+                    <div className={`verify-feedback-msg ${status.correct ? 'msg-success' : status.trap ? 'msg-warning' : 'msg-error'}`}>
                       {status.correct ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}
                       <span>{status.message}</span>
-                      {!status.correct && wrongCount > 0 && (
+                      {!status.correct && !status.trap && wrongCount > 0 && (
                         <span className="attempt-badge">Failed attempts: {wrongCount}</span>
                       )}
                     </div>
@@ -1420,64 +1455,50 @@ export default function Investigation() {
               </div>
             )}
 
-            {/* ── Incident Containment Playbook ── */}
-            <div className="incident-containment-card">
-              <div className="containment-header">
-                <ShieldAlert size={16} className="containment-icon" />
-                <div>
-                  <h4 className="containment-title">Incident Containment Playbook</h4>
-                  <p className="containment-subtitle">
-                    Select target host and compromised account for immediate automated quarantine upon incident submission.
-                  </p>
+            {/* ── Incident Containment Playbook (Connected to Admin Containment Targets) ── */}
+            {(distinctHosts.length > 0 || distinctUsers.length > 0) && (
+              <div className="containment-playbook-card">
+                <div className="containment-playbook-header">
+                  <ShieldAlert size={16} color="#f59e0b" />
+                  <div>
+                    <h4>Incident Response & Containment Playbook</h4>
+                    <p>
+                      Final Triage Action: Based on the evidence you uncovered, select the compromised host to isolate from the domain and the compromised user account to disable. (Avoid isolating uninvolved servers or disabling built-in <code>SYSTEM</code> / <code>$</code> machine accounts!)
+                    </p>
+                  </div>
+                </div>
+
+                <div className="containment-select-grid">
+                  <div className="containment-field">
+                    <label>1. Endpoint to Isolate (Quarantine Host)</label>
+                    <select
+                      className="answer-input"
+                      value={containmentHost}
+                      onChange={(e) => setContainmentHost(e.target.value)}
+                    >
+                      <option value="">-- Select Compromised Host to Isolate --</option>
+                      {distinctHosts.map((h) => (
+                        <option key={h} value={h}>{h}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="containment-field">
+                    <label>2. Account to Disable / Reset Password</label>
+                    <select
+                      className="answer-input"
+                      value={containmentUser}
+                      onChange={(e) => setContainmentUser(e.target.value)}
+                    >
+                      <option value="">-- Select Compromised Account to Disable --</option>
+                      {distinctUsers.map((u) => (
+                        <option key={u} value={u}>{u}</option>
+                      ))}
+                    </select>
+                  </div>
                 </div>
               </div>
-
-              <div className="containment-fields-grid">
-                <div className="containment-field">
-                  <label className="containment-label">
-                    <Network size={12} /> Target Host to Isolate:
-                  </label>
-                  <select
-                    className="containment-select"
-                    value={containmentHost}
-                    onChange={(e) => setContainmentHost(e.target.value)}
-                  >
-                    <option value="">-- No Host Isolation Required --</option>
-                    {distinctHosts.map((h) => (
-                      <option key={h} value={h}>
-                        🖥️ {h}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="containment-field">
-                  <label className="containment-label">
-                    <Lock size={12} /> Compromised User to Suspend:
-                  </label>
-                  <select
-                    className="containment-select"
-                    value={containmentUser}
-                    onChange={(e) => setContainmentUser(e.target.value)}
-                  >
-                    <option value="">-- No Account Lockout Required --</option>
-                    {distinctUsers.map((u) => (
-                      <option key={u} value={u}>
-                        👤 {u}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              {(containmentHost || containmentUser) && (
-                <div className="containment-preview-pill">
-                  ⚡ <strong>Containment Actions Queued:</strong>
-                  {containmentHost && <span> [Network Quarantine: {containmentHost}]</span>}
-                  {containmentUser && <span> [Disable Kerberos/NTLM: {containmentUser}]</span>}
-                </div>
-              )}
-            </div>
+            )}
 
             <button type="submit" className="inv-submit-btn" disabled={submitting}>
               {submitting ? (

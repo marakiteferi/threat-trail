@@ -63,8 +63,9 @@ class QuestionAdminOut(BaseModel):
     question_text: str
     correct_answer: str
     acceptable_answers: Optional[list[str]] = Field(default_factory=list)
-    explanation: Optional[str] = None
+    free_hint: Optional[str] = None
     hint: Optional[str] = None
+    explanation: Optional[str] = None
     points: int = 10
 
     model_config = {"from_attributes": True}
@@ -85,6 +86,7 @@ class VerifyFindingRequest(BaseModel):
 class VerifyFindingResponse(BaseModel):
     question_id: int
     is_correct: bool
+    trap_detected: bool = False
     message: str
     trap_msg: Optional[str] = None
 
@@ -106,6 +108,17 @@ class SubmissionRequest(BaseModel):
     user_guesses: Optional[dict[str, list[str]]] = Field(default_factory=dict)
     containment_host: Optional[str] = None
     containment_user: Optional[str] = None
+
+
+class ContainmentResult(BaseModel):
+    enabled: bool = False
+    expected_host: Optional[str] = None
+    selected_host: Optional[str] = None
+    host_correct: Optional[bool] = None
+    expected_user: Optional[str] = None
+    selected_user: Optional[str] = None
+    user_correct: Optional[bool] = None
+    feedback: Optional[str] = None
 
 
 # ── Grading result (response) ─────────────────────────────────────────────────
@@ -135,6 +148,7 @@ class SubmissionResponse(BaseModel):
     free_hints_used: list[int] = Field(default_factory=list)
     hint_penalty: int = 0
     trials_count: int = 1
+    containment_eval: Optional[ContainmentResult] = None
     results: list[QuestionResult]
 
 
@@ -170,6 +184,8 @@ class QuestionCreate(BaseModel):
     question_text: str
     correct_answer: str
     acceptable_answers: Optional[list[str]] = Field(default_factory=list)
+    free_hint: Optional[str] = None
+    hint: Optional[str] = None
     explanation: Optional[str] = None
     points: int = 10
 

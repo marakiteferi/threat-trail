@@ -1,1226 +1,805 @@
-2. ImplementationFile 1: Create threattrail-backend/zip_analyzer.py (New Module)Create threattrail-backend/zip_analyzer.py to handle full-archive streaming, normalization, multi-event correlation, observed AD extraction, and evidence-backed question generation:Pythonimport io
-import re
-import json
-import zipfile
-from datetime import datetime
-from collections import Counter, defaultdict
-from typing import Any, Optional
-
-MAX_ZIP_BYTES = 200 * 1024 * 1024          # 200 MB compressed limit
-MAX_UNCOMPRESSED_BYTES = 250 * 1024 * 1024 # 250 MB uncompressed limit
-
-PRIORITY_EVENT_IDS = {
-    4624, 4625, 4648, 4662, 4672, 4688, 4697, 4698, 4768, 4769, 5140, 5145, 7045,
-    4103, 4104, 1, 3, 7, 8, 10, 11, 12, 13, 17, 18, 22
-}
-
-BENIGN_SYSTEM_PROCESSES = {
-    "svchost.exe", "msmpeng.exe", "csrss.exe", "wininit.exe",
-    "services.exe", "lsass.exe", "smss.exe", "wmiprvse.exe", "taskhostw.exe"
-}
-
-PLACEHOLDER_IPS = {"-", "", "::1", "127.0.0.1", "0.0.0.0", "localhost", "none"}
-
-DCSYNC_GUIDS = (
-    "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2",
-    "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2",
-    "89e95b76-444d-4c62-991a-0facbeda640c",
-)
-
-
-def extract_field_from_message(msg: str, pattern: str) -> Optional[str]:
-    if not msg:
-        return None
-    matches = re.findall(pattern, msg, re.IGNORECASE)
-    valid = [m.strip() for m in matches if m and m.strip() not in ("-", "")]
-    return valid[-1] if valid else None
-
-
-def clean_str(val: Any) -> Optional[str]:
-    if val is None:
-        return None
-    s = str(val).strip()
-    return None if s in ("", "-", "None", "null") else s
-
-
-def clean_ip(val: Any) -> Optional[str]:
-    s = clean_str(val)
-    if not s or s.lower() in PLACEHOLDER_IPS or s.lower().startswith("fe80:"):
-        return None
-    return s
-
-
-def normalize_event(data: dict) -> dict:
-    """Normalizes raw Windows Security / System / PowerShell / Sysmon JSON into a consistent dict."""
-    ts_str = (
-        data.get("@timestamp")
-        or data.get("TimeCreated")
-        or data.get("EventTime")
-        or data.get("UtcTime")
-    )
-    ts = None
-    if ts_str:
-        try:
-            clean_ts = str(ts_str).replace("Z", "+00:00")
-            if "T" in clean_ts:
-                ts = datetime.fromisoformat(clean_ts).replace(tzinfo=None)
-            else:
-                ts = datetime.strptime(clean_ts[:19], "%Y-%m-%d %H:%M:%S")
-        except Exception:
-            ts = None
-    if ts is None:
-        ts = datetime.now()
-
-    ev_raw = data.get("EventID") or data.get("event_id") or 0
-    if isinstance(ev_raw, dict):
-        ev_raw = ev_raw.get("$numberInt") or 0
-    try:
-        event_id = int(ev_raw)
-    except Exception:
-        event_id = 0
-
-    msg = data.get("Message") or ""
-
-    source_ip = (
-        clean_ip(data.get("IpAddress"))
-        or clean_ip(data.get("SourceAddress"))
-        or clean_ip(data.get("SourceIp"))
-        or clean_ip(data.get("SourceNetworkAddress"))
-        or clean_ip(extract_field_from_message(msg, r"Source Network Address:\s*([^\r\n\t]+)"))
-        or clean_ip(extract_field_from_message(msg, r"Client Address:\s*([^\r\n\t]+)"))
-    )
-
-    dest_ip = clean_ip(data.get("DestinationIp")) or clean_ip(data.get("DestAddress"))
-    dest_port = clean_str(data.get("DestinationPort")) or clean_str(data.get("DestPort"))
-
-    subject_user = (
-        clean_str(data.get("SubjectUserName"))
-        or extract_field_from_message(msg, r"Subject:[\s\S]*?Account Name:\s*([^\r\n\t]+)")
-    )
-    target_user = (
-        clean_str(data.get("TargetUserName"))
-        or clean_str(data.get("AccountName"))
-        or clean_str(data.get("TargetUser"))
-        or extract_field_from_message(msg, r"New Logon:[\s\S]*?Account Name:\s*([^\r\n\t]+)")
-        or extract_field_from_message(msg, r"Account For Which Logon Failed:[\s\S]*?Account Name:\s*([^\r\n\t]+)")
-    )
-    username = target_user or subject_user or clean_str(data.get("User"))
-
-    domain = (
-        clean_str(data.get("TargetDomainName"))
-        or clean_str(data.get("SubjectDomainName"))
-        or clean_str(data.get("AccountDomain"))
-        or clean_str(data.get("Domain"))
-        or extract_field_from_message(msg, r"Account Domain:\s*([^\r\n\t]+)")
-    )
-
-    target_host = (
-        clean_str(data.get("Hostname"))
-        or clean_str(data.get("Computer"))
-        or clean_str(data.get("host"))
-        or clean_str(data.get("WorkstationName"))
-        or extract_field_from_message(msg, r"Workstation Name:\s*([^\r\n\t]+)")
-    )
-
-    image = (
-        clean_str(data.get("Image"))
-        or clean_str(data.get("NewProcessName"))
-        or clean_str(data.get("SourceImage"))
-        or clean_str(data.get("ProcessName"))
-    )
-    parent_image = clean_str(data.get("ParentImage")) or clean_str(data.get("ParentProcessName"))
-    target_image = clean_str(data.get("TargetImage"))
-    command_line = (
-        clean_str(data.get("CommandLine"))
-        or clean_str(data.get("ProcessCommandLine"))
-        or extract_field_from_message(msg, r"Process Command Line:\s*([^\r\n]+)")
-    )
-    service_name = clean_str(data.get("ServiceName")) or extract_field_from_message(msg, r"Service Name:\s*([^\r\n\t]+)")
-    ticket_enc = clean_str(data.get("TicketEncryptionType")) or extract_field_from_message(msg, r"Ticket Encryption Type:\s*(0x[0-9a-fA-F]+|[0-9]+)")
-    properties = clean_str(data.get("Properties")) or extract_field_from_message(msg, r"Properties:\s*([^\r\n]+)")
-    access_mask = clean_str(data.get("AccessMask")) or extract_field_from_message(msg, r"Access Mask:\s*(0x[0-9a-fA-F]+)")
-    granted_access = clean_str(data.get("GrantedAccess"))
-    target_object = clean_str(data.get("TargetObject"))
-    script_block = clean_str(data.get("ScriptBlockText")) or clean_str(data.get("Payload"))
-
-    return {
-        "event_id": event_id,
-        "timestamp": ts,
-        "source_ip": source_ip,
-        "dest_ip": dest_ip,
-        "dest_port": dest_port,
-        "subject_user": subject_user,
-        "target_user": target_user,
-        "username": username,
-        "domain": domain,
-        "target_host": target_host,
-        "image": image,
-        "parent_image": parent_image,
-        "target_image": target_image,
-        "command_line": command_line,
-        "service_name": service_name,
-        "ticket_enc": ticket_enc,
-        "properties": properties,
-        "access_mask": access_mask,
-        "granted_access": granted_access,
-        "target_object": target_object,
-        "script_block": script_block,
-        "message": msg,
-        "raw": data,
-    }
-
-
-def stream_and_normalize_zip(content: bytes) -> tuple[list[dict], list[str]]:
-    """
-    Stage 1 & 2: Validates ZIP archive size/compression bounds and streams all JSON/JSONL records.
-    """
-    if len(content) > MAX_ZIP_BYTES:
-        raise ValueError("ZIP file exceeds the 200 MB maximum upload limit.")
-
-    events: list[dict] = []
-    files_processed: list[str] = []
-    total_uncompressed = 0
-
-    with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
-                continue
-            if not (info.filename.endswith(".json") or info.filename.endswith(".jsonl")):
-                continue
-
-            total_uncompressed += info.file_size
-            if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
-                raise ValueError("Uncompressed log data exceeds 250 MB safety limit.")
-
-            files_processed.append(info.filename)
-            with zf.open(info) as f:
-                first_chunk = f.read(2048).decode("utf-8", errors="replace").lstrip()
-                f.seek(0)
-
-                if first_chunk.startswith("["):
-                    raw_text = f.read().decode("utf-8", errors="replace").strip()
-                    try:
-                        arr = json.loads(raw_text)
-                        if isinstance(arr, list):
-                            for item in arr:
-                                if isinstance(item, dict):
-                                    events.append(normalize_event(item))
-                    except Exception:
-                        pass
-                else:
-                    for raw_line in f:
-                        line = raw_line.decode("utf-8", errors="replace").strip()
-                        if not line:
-                            continue
-                        try:
-                            item = json.loads(line)
-                            if isinstance(item, dict):
-                                events.append(normalize_event(item))
-                        except Exception:
-                            continue
-
-    events.sort(key=lambda x: x["timestamp"])
-    return events, files_processed
-
-
-def extract_observed_ad_context(events: list[dict]) -> dict[str, Any]:
-    """
-    Stage 4: Extracts strictly observed facts from the logs and separates inferred roles.
-    Never fabricates domain controllers or privileges that aren't backed by log telemetry.
-    """
-    domains = Counter()
-    hosts = Counter()
-    human_users = Counter()
-    machine_accounts = Counter()
-    services_spns = Counter()
-    event_counts = Counter()
-    dc_candidate_hosts = set()
-
-    for ev in events:
-        eid = ev["event_id"]
-        event_counts[str(eid)] += 1
-
-        if ev["domain"] and ev["domain"].upper() not in ("NT AUTHORITY", "WORKGROUP", "WINDOWSMANAGER", "FONT DRIVER HOST"):
-            domains[ev["domain"]] += 1
-
-        if ev["target_host"]:
-            hosts[ev["target_host"]] += 1
-            if eid in (4662, 4768, 4769):
-                dc_candidate_hosts.add(ev["target_host"])
-
-        for u in (ev["subject_user"], ev["target_user"], ev["username"]):
-            if not u:
-                continue
-            u_clean = u.split("\\")[-1]
-            if u_clean.upper() in ("SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE", "ANONYMOUS LOGON", "-"):
-                continue
-            if u_clean.endswith("$"):
-                machine_accounts[u_clean] += 1
-            else:
-                human_users[u_clean] += 1
-
-        if ev["service_name"] and not ev["service_name"].endswith("$") and ev["service_name"].lower() != "krbtgt":
-            services_spns[ev["service_name"]] += 1
-
-    timestamps = [ev["timestamp"] for ev in events if ev["timestamp"]]
-    time_window = {
-        "first_event_utc": timestamps[0].isoformat() if timestamps else None,
-        "last_event_utc": timestamps[-1].isoformat() if timestamps else None,
-        "total_events_analyzed": len(events),
-    }
-
-    return {
-        "schema_note": "Extracted automatically from log telemetry. Distinguishes directly observed entities from inferred roles.",
-        "telemetry_summary": time_window,
-        "observed_domains": [d for d, _ in domains.most_common(5)],
-        "observed_hosts": [{"hostname": h, "event_count": c} for h, c in hosts.most_common(10)],
-        "observed_user_accounts": [{"username": u, "occurrences": c} for u, c in human_users.most_common(12)],
-        "observed_machine_accounts": [m for m, _ in machine_accounts.most_common(8)],
-        "observed_services_and_spns": [{"service": s, "occurrences": c} for s, c in services_spns.most_common(8)],
-        "inferred_roles": {
-            "potential_domain_controllers": sorted(dc_candidate_hosts),
-            "inference_basis": "Hosts logging Active Directory Kerberos (4768/4769) or Directory Replication (4662) events" if dc_candidate_hosts else "No AD DC-specific events (4662/4768/4769) observed",
-        },
-        "top_event_ids": dict(event_counts.most_common(10)),
-    }
-
-
-def _short_proc(path_str: Optional[str]) -> Optional[str]:
-    if not path_str:
-        return None
-    return path_str.replace("/", "\\").split("\\")[-1]
-
-
-def evaluate_detection_rules(events: list[dict]) -> dict[str, Any]:
-    """
-    Stage 3: Deterministic multi-event detection & correlation engine with benign exclusions,
-    confidence levels, and evidence-backed question generation.
-    """
-    candidates = []
-
-    # ── RULE 1: DCSync Directory Replication (T1003.006) ─────────────────────
-    dcsync_hits = []
-    for idx, ev in enumerate(events):
-        if ev["event_id"] == 4662:
-            hay = f"{ev['properties'] or ''} {ev['message'] or ''}".lower()
-            if any(g in hay for g in DCSYNC_GUIDS):
-                actor = ev["subject_user"] or ev["username"] or ""
-                # Filter out normal Domain Controller machine account replication ($ suffix)
-                if not actor.endswith("$"):
-                    dcsync_hits.append((idx, ev))
-
-    if dcsync_hits:
-        sample_ev = dcsync_hits[0][1]
-        actor = sample_ev["subject_user"] or sample_ev["username"]
-        host = sample_ev["target_host"]
-        mask = sample_ev["access_mask"]
-        questions = [
-            {
-                "question_text": "[Phase 1: Alert Triage] Which Windows Security Event ID records the directory service object access associated with DCSync replication checks?",
-                "correct_answer": "4662",
-                "acceptable_answers": ["4662"],
-                "explanation": f"Observed {len(dcsync_hits)} Event ID 4662 records referencing MS-DRSR replication GUIDs.",
-                "points": 15,
-            }
-        ]
-        if actor:
-            questions.append({
-                "question_text": "[Phase 2: Attribution] Inspect Event 4662 containing replication GUID 1131f6aa.../1131f6ad... Which non-machine user account (SubjectUserName) initiated the replication request?",
-                "correct_answer": actor.split("\\")[-1],
-                "acceptable_answers": list({actor.lower(), actor.split("\\")[-1].lower()}),
-                "explanation": f"Unlike routine Domain Controller machine accounts (ending in '$'), user account '{actor}' requested directory replication privileges.",
-                "points": 25,
-            })
-        if host:
-            questions.append({
-                "question_text": "[Phase 3: Scope] Which host recorded the Event 4662 directory replication activity?",
-                "correct_answer": host,
-                "acceptable_answers": list({host.lower(), host.split(".")[0].lower()}),
-                "explanation": f"The directory service access events were logged by host '{host}'.",
-                "points": 20,
-            })
-        if mask:
-            questions.append({
-                "question_text": "[Phase 4: Telemetry Verification] What hex Access Mask value was recorded in the suspicious Event 4662 logs?",
-                "correct_answer": mask,
-                "acceptable_answers": [mask.lower(), mask.replace("0x", "").lower()],
-                "explanation": f"Access Mask '{mask}' (Control Access) is required to exercise extended AD replication rights.",
-                "points": 20,
-            })
-
-        candidates.append({
-            "score": 95,
-            "confidence": "High Confidence (Correlated AD Replication GUIDs + Non-Machine Account)",
-            "name": "Active Directory DCSync Replication Abuse",
-            "mitre_technique": "T1003.006",
-            "severity": "Critical",
-            "alert_title": "Critical: Non-DC Account Requesting Directory Replication Changes (Event 4662)",
-            "description": (
-                f"Telemetry analysis across {len(events)} events identified {len(dcsync_hits)} Event ID 4662 records "
-                "where a non-machine account requested MS-DRSR Directory Replication Service extended rights "
-                "(DS-Replication-Get-Changes). Investigate the replication events, verify whether the initiating account "
-                "is authorized, and determine the scope of domain exposure."
-            ),
-            "sigma_rule": """title: Directory Replication Service (DCSync) Access by Non-Machine Account
-status: stable
-logsource:
-  product: windows
-  service: security
-detection:
-  selection:
-    EventID: 4662
-    Properties|contains:
-      - '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2'
-      - '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2'
-      - '89e95b76-444d-4c62-991a-0facbeda640c'
-  filter:
-    SubjectUserName|endswith: '$'
-  condition: selection and not filter
-level: critical
-tags:
-  - attack.credential_access
-  - attack.t1003.006""",
-            "key_indices": {i for i, _ in dcsync_hits},
-            "evidence_summary": [
-                f"{len(dcsync_hits)} Event 4662 log(s) matched DS-Replication GUIDs from non-machine actor '{actor or 'unknown'}'",
-                f"Target host: {host or 'unknown'} | AccessMask: {mask or 'N/A'}",
-            ],
-            "caveats": [
-                "Verify that the initiating account is not a legitimate Azure AD Connect (MSOL_) or authorized backup replication service account."
-            ],
-            "questions": questions,
-        })
-
-    # ── RULE 2: LSASS Memory Access / Credential Dumping (T1003.001) ─────────
-    lsass_hits = []
-    ps_mimikatz_hits = []
-    for idx, ev in enumerate(events):
-        if ev["event_id"] == 10 and ev["target_image"] and ev["target_image"].lower().endswith("\\lsass.exe"):
-            caller = (_short_proc(ev["image"]) or "").lower()
-            ga = (ev["granted_access"] or "").lower()
-            if caller not in BENIGN_SYSTEM_PROCESSES and any(m in ga for m in ("0x1010", "0x1410", "0x1438", "0x1fffff")):
-                lsass_hits.append((idx, ev))
-        elif ev["event_id"] in (4103, 4104):
-            hay = f"{ev['script_block'] or ''} {ev['message'] or ''}".lower()
-            if any(k in hay for k in ("sekurlsa", "logonpasswords", "invoke-mimikatz", "lsadump")):
-                ps_mimikatz_hits.append((idx, ev))
-
-    if lsass_hits or ps_mimikatz_hits:
-        all_hits = lsass_hits + ps_mimikatz_hits
-        sample_ev = (lsass_hits[0][1] if lsass_hits else ps_mimikatz_hits[0][1])
-        caller_proc = _short_proc(sample_ev["image"])
-        ga_mask = sample_ev["granted_access"]
-        host = sample_ev["target_host"]
-        is_both = bool(lsass_hits and ps_mimikatz_hits)
-
-        questions = [
-            {
-                "question_text": "[Phase 1: Target Identification] Which Windows subsystem process was targeted for memory access in Sysmon Event ID 10?",
-                "correct_answer": "lsass.exe",
-                "acceptable_answers": ["lsass.exe", "lsass", "c:\\windows\\system32\\lsass.exe"],
-                "explanation": "Sysmon Event ID 10 records a process handle opened against C:\\Windows\\System32\\lsass.exe.",
-                "points": 15,
-            }
-        ]
-        if caller_proc:
-            questions.append({
-                "question_text": "[Phase 2: Process Attribution] Which non-standard executable (SourceImage) accessed lsass.exe memory?",
-                "correct_answer": caller_proc,
-                "acceptable_answers": list({caller_proc.lower(), (sample_ev["image"] or caller_proc).lower()}),
-                "explanation": f"Sysmon Event 10 identifies '{sample_ev['image']}' as the SourceImage opening lsass.exe.",
-                "points": 25,
-            })
-        if ga_mask:
-            questions.append({
-                "question_text": "[Phase 3: Access Rights] What hex GrantedAccess value was requested on the lsass.exe process handle?",
-                "correct_answer": ga_mask,
-                "acceptable_answers": [ga_mask.lower()],
-                "explanation": f"GrantedAccess '{ga_mask}' includes PROCESS_VM_READ permissions required to read credential material from memory.",
-                "points": 20,
-            })
-        if host:
-            questions.append({
-                "question_text": "[Phase 4: Endpoint Scope] On which workstation/host did this LSASS memory access occur?",
-                "correct_answer": host,
-                "acceptable_answers": list({host.lower(), host.split(".")[0].lower()}),
-                "explanation": f"The activity was recorded on host '{host}'.",
-                "points": 20,
-            })
-
-        candidates.append({
-            "score": 92 if is_both else 84,
-            "confidence": "High Confidence (Sysmon Event 10 + PowerShell Telemetry)" if is_both else "Medium-High Confidence (Sysmon Event 10 Non-System Caller)",
-            "name": "Suspicious LSASS Process Memory Access (Credential Dumping)",
-            "mitre_technique": "T1003.001",
-            "severity": "Critical",
-            "alert_title": "Critical: Non-System Process Accessing LSASS.exe Memory (Sysmon Event 10)",
-            "description": (
-                f"Analysis of {len(events)} events detected {len(lsass_hits)} Sysmon Event ID 10 process access record(s) "
-                f"targeting lsass.exe from '{caller_proc or 'a non-system process'}' with memory-read access flags. "
-                "Investigate the calling process, granted access mask, and surrounding PowerShell or DLL telemetry."
-            ),
-            "sigma_rule": """title: Suspicious Process Access to LSASS Memory (Sysmon Event 10)
-status: stable
-logsource:
-  product: windows
-  category: process_access
-detection:
-  selection:
-    EventID: 10
-    TargetImage|endswith: '\\lsass.exe'
-    GrantedAccess|contains:
-      - '0x1010'
-      - '0x1410'
-      - '0x1438'
-  condition: selection
-level: critical
-tags:
-  - attack.credential_access
-  - attack.t1003.001""",
-            "key_indices": {i for i, _ in all_hits},
-            "evidence_summary": [
-                f"{len(lsass_hits)} Sysmon Event 10 handle(s) to lsass.exe by '{caller_proc or 'unknown'}' (GrantedAccess: {ga_mask or 'N/A'})",
-                f"{len(ps_mimikatz_hits)} PowerShell ScriptBlock/Module event(s) matching credential dumping keywords",
-            ],
-            "caveats": [
-                "Legitimate EDR/antivirus agents may open handles to lsass.exe; always verify the SourceImage path and CallTrace."
-            ],
-            "questions": questions,
-        })
-
-    # ── RULE 3: Kerberoasting RC4 Service Ticket Requests (T1558.003) ────────
-    kerb_hits = []
-    for idx, ev in enumerate(events):
-        if ev["event_id"] == 4769:
-            enc = (ev["ticket_enc"] or "").lower()
-            svc = ev["service_name"] or ""
-            if enc in ("0x17", "23") and svc and not svc.endswith("$") and svc.lower() != "krbtgt":
-                kerb_hits.append((idx, ev))
-
-    if kerb_hits:
-        sample_ev = kerb_hits[0][1]
-        actor = sample_ev["target_user"] or sample_ev["username"]
-        svc = sample_ev["service_name"]
-        src_ip = sample_ev["source_ip"]
-        questions = []
-        if actor:
-            questions.append({
-                "question_text": "[Phase 1: Attribution] Which domain user account requested the RC4-encrypted (0x17) Kerberos service ticket in Event ID 4769?",
-                "correct_answer": actor.split("@")[0].split("\\")[-1],
-                "acceptable_answers": list({actor.lower(), actor.split("@")[0].lower(), actor.split("\\")[-1].lower()}),
-                "explanation": f"Event ID 4769 records account '{actor}' requesting an RC4-HMAC service ticket.",
-                "points": 20,
-            })
-        if svc:
-            questions.append({
-                "question_text": "[Phase 2: Target SPN] Which Service Name / account was targeted in the RC4 (0x17) TGS request?",
-                "correct_answer": svc,
-                "acceptable_answers": [svc.lower()],
-                "explanation": f"The Service Name field in the 0x17 Event 4769 log is '{svc}'.",
-                "points": 25,
-            })
-        questions.append({
-            "question_text": "[Phase 3: Encryption Indicator] What hex value in TicketEncryptionType identifies legacy RC4-HMAC encryption?",
-            "correct_answer": "0x17",
-            "acceptable_answers": ["0x17", "17", "23"],
-            "explanation": "In Windows Event 4769, 0x17 (decimal 23) indicates RC4-HMAC encryption.",
-            "points": 15,
-        })
-        if src_ip:
-            questions.append({
-                "question_text": "[Phase 4: Network Pivot] From which Client / Source IP address was the RC4 service ticket requested?",
-                "correct_answer": src_ip,
-                "acceptable_answers": [src_ip.lower()],
-                "explanation": f"The Client Address recorded in the Event 4769 log is '{src_ip}'.",
-                "points": 20,
-            })
-
-        candidates.append({
-            "score": 88,
-            "confidence": "High Confidence (Event 4769 RC4 0x17 for Non-Machine SPN)",
-            "name": "Potential Kerberoasting — RC4 Service Ticket Request",
-            "mitre_technique": "T1558.003",
-            "severity": "High",
-            "alert_title": "High Severity: Kerberos TGS Ticket Requested with Legacy RC4 Encryption (0x17)",
-            "description": (
-                f"Detected {len(kerb_hits)} Kerberos Service Ticket (Event ID 4769) request(s) using legacy RC4-HMAC (0x17) "
-                f"encryption targeting service '{svc}' from account '{actor or 'unknown'}'. Filter out standard AES256 (0x12) "
-                "and machine account ('$') noise to investigate the anomalous request."
-            ),
-            "sigma_rule": """title: Kerberoasting - RC4 Ticket Encryption Requested (Event 4769)
-status: stable
-logsource:
-  product: windows
-  service: security
-detection:
-  selection:
-    EventID: 4769
-    TicketEncryptionType: '0x17'
-  filter:
-    ServiceName|endswith: '$'
-  condition: selection and not filter
-level: high
-tags:
-  - attack.credential_access
-  - attack.t1558.003""",
-            "key_indices": {i for i, _ in kerb_hits},
-            "evidence_summary": [
-                f"{len(kerb_hits)} Event 4769 log(s) with TicketEncryptionType=0x17 for service '{svc}' by '{actor or 'unknown'}'",
-            ],
-            "caveats": [
-                "RC4 (0x17) requests can occasionally occur if a legacy service account does not support AES; correlate with user behavior and SPN privileges."
-            ],
-            "questions": questions,
-        })
-
-    # ── RULE 4: Service Installation / PsExec & LSA Secrets (T1003.004 / T1569.002)
-    svc_hits = []
-    lsa_reg_hits = []
-    for idx, ev in enumerate(events):
-        if ev["event_id"] in (7045, 4697):
-            svc_hits.append((idx, ev))
-        elif ev["event_id"] in (12, 13) and ev["target_object"] and "policy\\secrets" in ev["target_object"].lower():
-            lsa_reg_hits.append((idx, ev))
-        elif ev["event_id"] == 1 and "psexec" in f"{ev['image'] or ''} {ev['command_line'] or ''}".lower():
-            svc_hits.append((idx, ev))
-
-    if svc_hits or lsa_reg_hits:
-        all_hits = svc_hits + lsa_reg_hits
-        svc_ev = next((e for _, e in svc_hits if e["service_name"]), svc_hits[0][1] if svc_hits else lsa_reg_hits[0][1])
-        svc_name = svc_ev["service_name"] or "PSEXESVC"
-        host = svc_ev["target_host"]
-        questions = [
-            {
-                "question_text": "[Phase 1: Service Persistence/Execution] Which service name was registered on the target host (Event ID 7045 / 4697)?",
-                "correct_answer": svc_name,
-                "acceptable_answers": list({svc_name.lower(), f"{svc_name.lower()}.exe"}),
-                "explanation": f"Service installation telemetry recorded ServiceName '{svc_name}'.",
-                "points": 20,
-            }
-        ]
-        if lsa_reg_hits:
-            questions.append({
-                "question_text": "[Phase 2: Registry Forensics] Inspect Sysmon Registry events (Event ID 12/13). Which HKLM SECURITY registry subkey path was accessed to read LSA Secrets?",
-                "correct_answer": "Policy\\Secrets",
-                "acceptable_answers": ["policy\\secrets", "hklm\\security\\policy\\secrets", "security\\policy\\secrets"],
-                "explanation": f"Observed {len(lsa_reg_hits)} registry event(s) accessing HKLM\\SECURITY\\Policy\\Secrets.",
-                "points": 25,
-            })
-        if host:
-            questions.append({
-                "question_text": "[Phase 3: Endpoint Scope] On which target hostname did this service execution occur?",
-                "correct_answer": host,
-                "acceptable_answers": list({host.lower(), host.split(".")[0].lower()}),
-                "explanation": f"The events were recorded on host '{host}'.",
-                "points": 20,
-            })
-
-        candidates.append({
-            "score": 90 if (svc_hits and lsa_reg_hits) else 78,
-            "confidence": "High Confidence (Correlated Service Install + LSA Registry Access)" if (svc_hits and lsa_reg_hits) else "Medium Confidence (Service Installation Observed)",
-            "name": "PsExec Service Execution & LSA Secrets Access" if lsa_reg_hits else f"Suspicious Service Installation ({svc_name})",
-            "mitre_technique": "T1003.004" if lsa_reg_hits else "T1569.002",
-            "severity": "High",
-            "alert_title": f"High Severity: Remote Service Installation ({svc_name}) & Privileged Execution",
-            "description": (
-                f"Detected {len(svc_hits)} service installation/execution event(s) ({svc_name}) and "
-                f"{len(lsa_reg_hits)} registry access event(s) targeting HKLM\\SECURITY\\Policy\\Secrets. "
-                "Investigate the installed service binary, execution account, and registry artifacts."
-            ),
-            "sigma_rule": f"""title: Suspicious Service Installation ({svc_name})
-status: stable
-logsource:
-  product: windows
-  service: system
-detection:
-  selection:
-    EventID: 7045
-    ServiceName: '{svc_name}'
-  condition: selection
-level: high
-tags:
-  - attack.execution
-  - attack.t1569.002""",
-            "key_indices": {i for i, _ in all_hits},
-            "evidence_summary": [
-                f"{len(svc_hits)} service/process event(s) referencing '{svc_name}'",
-                f"{len(lsa_reg_hits)} Sysmon registry event(s) accessing Policy\\Secrets",
-            ],
-            "caveats": [
-                "Administrators occasionally use PsExec for remote maintenance; correlate with registry access and child process commands."
-            ],
-            "questions": questions,
-        })
-
-    # ── RULE 5: DCOM / Shell Process Spawning PowerShell (T1021.003) ─────────
-    dcom_hits = []
-    for idx, ev in enumerate(events):
-        if ev["event_id"] in (1, 4688):
-            parent = (_short_proc(ev["parent_image"]) or "").lower()
-            child = (_short_proc(ev["image"]) or "").lower()
-            if parent in ("explorer.exe", "mmc.exe") and child in ("powershell.exe", "pwsh.exe", "cmd.exe"):
-                dcom_hits.append((idx, ev))
-        elif "9ba05972-f6a8-11cf-a442-00a0c90a8f39" in f"{ev['command_line'] or ''} {ev['script_block'] or ''} {ev['message'] or ''}".lower():
-            dcom_hits.append((idx, ev))
-
-    if dcom_hits:
-        sample_ev = dcom_hits[0][1]
-        parent_proc = _short_proc(sample_ev["parent_image"]) or "explorer.exe"
-        child_proc = _short_proc(sample_ev["image"]) or "powershell.exe"
-        host = sample_ev["target_host"]
-        questions = [
-            {
-                "question_text": "[Phase 1: Process Lineage] Which parent process spawned the suspicious command interpreter during the lateral movement?",
-                "correct_answer": parent_proc,
-                "acceptable_answers": list({parent_proc.lower(), (sample_ev["parent_image"] or parent_proc).lower()}),
-                "explanation": f"Process creation telemetry shows ParentImage '{sample_ev['parent_image'] or parent_proc}'.",
-                "points": 20,
-            },
-            {
-                "question_text": "[Phase 2: Payload Execution] Which child executable was spawned by the parent shell process?",
-                "correct_answer": child_proc,
-                "acceptable_answers": list({child_proc.lower(), (sample_ev["image"] or child_proc).lower()}),
-                "explanation": f"The spawned child process Image is '{sample_ev['image'] or child_proc}'.",
-                "points": 20,
-            },
-        ]
-        if host:
-            questions.append({
-                "question_text": "[Phase 3: Endpoint Scope] On which target host was the process spawned?",
-                "correct_answer": host,
-                "acceptable_answers": list({host.lower(), host.split(".")[0].lower()}),
-                "explanation": f"The process creation event was recorded on '{host}'.",
-                "points": 20,
-            })
-
-        candidates.append({
-            "score": 82,
-            "confidence": "Medium-High Confidence (Shell Parent Spawning Command Interpreter / DCOM Chain)",
-            "name": "Lateral Movement via DCOM ShellWindows / Explorer Process Chain",
-            "mitre_technique": "T1021.003",
-            "severity": "High",
-            "alert_title": f"High Severity: {parent_proc} Spawning {child_proc} (Potential DCOM Lateral Movement)",
-            "description": (
-                f"Identified {len(dcom_hits)} process/script event(s) where '{parent_proc}' spawned '{child_proc}' "
-                "or invoked the ShellWindows DCOM CLSID. Correlate the process creation command line with preceding "
-                "network logon (Event 4624 Type 3) and PowerShell ScriptBlock (Event 4104) logs."
-            ),
-            "sigma_rule": """title: DCOM ShellWindows Lateral Movement (Explorer Spawning PowerShell)
-status: stable
-logsource:
-  product: windows
-  category: process_creation
-detection:
-  selection:
-    ParentImage|endswith: '\\explorer.exe'
-    Image|endswith: '\\powershell.exe'
-  condition: selection
-level: high
-tags:
-  - attack.lateral_movement
-  - attack.t1021.003""",
-            "key_indices": {i for i, _ in dcom_hits},
-            "evidence_summary": [
-                f"{len(dcom_hits)} event(s) showing {parent_proc} -> {child_proc} execution chain on '{host or 'unknown'}'",
-            ],
-            "caveats": [
-                "A local user launching PowerShell from the Start Menu or Explorer address bar also produces explorer.exe -> powershell.exe; always check CommandLine and network logons (4624 Type 3) to confirm remote DCOM abuse."
-            ],
-            "questions": questions,
-        })
-
-    # ── RULE 6: PowerShell Web Download / Python HTTP Staging (T1059.001) ────
-    ps_web_hits = []
-    detected_port = None
-    for idx, ev in enumerate(events):
-        hay = f"{ev['command_line'] or ''} {ev['script_block'] or ''} {ev['message'] or ''}".lower()
-        if any(k in hay for k in ("invoke-webrequest", "downloadstring", "http.server", "simplehttpserver", "net.webclient")):
-            ps_web_hits.append((idx, ev))
-            port_match = re.search(r"(?:http\.server|localport=|:)(\d{4,5})\b", hay)
-            if port_match and not detected_port:
-                detected_port = port_match.group(1)
-
-    if ps_web_hits:
-        sample_ev = ps_web_hits[0][1]
-        host = sample_ev["target_host"]
-        questions = [
-            {
-                "question_text": "[Phase 1: Telemetry Source] Which PowerShell Operational Event ID records full ScriptBlock code execution?",
-                "correct_answer": "4104",
-                "acceptable_answers": ["4104", "4103"],
-                "explanation": "Windows PowerShell Event ID 4104 captures the full ScriptBlock content.",
-                "points": 15,
-            }
-        ]
-        if detected_port:
-            questions.append({
-                "question_text": "[Phase 2: Network Staging] Which non-standard TCP port was used to host or download the staged payload?",
-                "correct_answer": detected_port,
-                "acceptable_answers": [detected_port, f"tcp/{detected_port}"],
-                "explanation": f"Command line and script telemetry reference TCP port {detected_port}.",
-                "points": 25,
-            })
-        if host:
-            questions.append({
-                "question_text": "[Phase 3: Endpoint Scope] On which hostname was the PowerShell download executed?",
-                "correct_answer": host,
-                "acceptable_answers": list({host.lower(), host.split(".")[0].lower()}),
-                "explanation": f"The PowerShell web download occurred on host '{host}'.",
-                "points": 20,
-            })
-
-        candidates.append({
-            "score": 80,
-            "confidence": "High Confidence (PowerShell Web Download / Staging Telemetry)",
-            "name": "PowerShell Web Download & Payload Staging",
-            "mitre_technique": "T1059.001",
-            "severity": "Medium",
-            "alert_title": "Medium Severity: PowerShell Web Download / HTTP Staging Detected",
-            "description": (
-                f"Detected {len(ps_web_hits)} event(s) containing PowerShell web download cradle commands or "
-                "ad-hoc HTTP staging servers. Inspect PowerShell ScriptBlock logs (Event 4104) and process creation "
-                "arguments to identify the staging port and target host."
-            ),
-            "sigma_rule": """title: PowerShell DownloadString / Invoke-WebRequest Execution
-status: stable
-logsource:
-  product: windows
-  service: powershell
-detection:
-  selection:
-    EventID: 4104
-    ScriptBlockText|contains:
-      - 'Invoke-WebRequest'
-      - 'DownloadString'
-      - 'Net.WebClient'
-  condition: selection
-level: medium
-tags:
-  - attack.execution
-  - attack.t1059.001""",
-            "key_indices": {i for i, _ in ps_web_hits},
-            "evidence_summary": [
-                f"{len(ps_web_hits)} event(s) matched PowerShell web download / HTTP staging patterns",
-            ],
-            "caveats": [
-                "Verify the destination URL/IP in the ScriptBlockText to distinguish internal administrative scripts from unauthorized staging."
-            ],
-            "questions": questions,
-        })
-
-    # ── RULE 7: Password Spraying (T1110.003) vs. Brute Force (T1110.001) ────
-    failures_by_ip: dict[str, list[tuple[int, dict]]] = defaultdict(list)
-    for idx, ev in enumerate(events):
-        if ev["event_id"] == 4625 and ev["source_ip"]:
-            failures_by_ip[ev["source_ip"]].append((idx, ev))
-
-    for ip, fail_list in failures_by_ip.items():
-        if len(fail_list) >= 6:
-            distinct_users = {ev["target_user"] or ev["username"] for _, ev in fail_list if (ev["target_user"] or ev["username"])}
-            is_spray = len(distinct_users) >= 5
-            success_hits = [
-                (idx, ev) for idx, ev in enumerate(events)
-                if ev["event_id"] == 4624 and ev["source_ip"] == ip
-            ]
-            compromised_user = success_hits[0][1]["target_user"] or success_hits[0][1]["username"] if success_hits else None
-
-            questions = [
-                {
-                    "question_text": "[Phase 1: Source Attribution] Which Source IP address generated the burst of failed authentication attempts (Event ID 4625)?",
-                    "correct_answer": ip,
-                    "acceptable_answers": [ip.lower()],
-                    "explanation": f"Source IP {ip} generated {len(fail_list)} failed logon events across {len(distinct_users)} distinct user account(s).",
-                    "points": 20,
-                }
-            ]
-            if compromised_user:
-                questions.append({
-                    "question_text": "[Phase 2: Compromised Account] Which account recorded a successful logon (Event ID 4624) from the attacking IP after the failures?",
-                    "correct_answer": compromised_user.split("\\")[-1],
-                    "acceptable_answers": list({compromised_user.lower(), compromised_user.split("\\")[-1].lower()}),
-                    "explanation": f"Filtering by Source IP {ip} and Event ID 4624 reveals a successful authentication to '{compromised_user}'.",
-                    "points": 25,
-                })
-
-            candidates.append({
-                "score": 89,
-                "confidence": f"High Confidence ({len(fail_list)} Failures Across {len(distinct_users)} Distinct Accounts)",
-                "name": "Active Directory Password Spraying" if is_spray else "Active Directory Brute Force Authentication",
-                "mitre_technique": "T1110.003" if is_spray else "T1110.001",
-                "severity": "High",
-                "alert_title": f"High Severity: {'Password Spraying' if is_spray else 'Brute Force'} from {ip}",
-                "description": (
-                    f"Observed {len(fail_list)} failed logon attempts (Event ID 4625) originating from {ip} "
-                    f"targeting {len(distinct_users)} distinct account(s)"
-                    + (f", followed by a successful logon (Event ID 4624) to '{compromised_user}'." if compromised_user else ".")
-                ),
-                "sigma_rule": """title: Active Directory Password Spraying Detected
-status: stable
-logsource:
-  product: windows
-  service: security
-detection:
-  selection:
-    EventID: 4625
-    LogonType: 3
-  condition: selection | count(TargetUserName) by IpAddress > 5
-level: high
-tags:
-  - attack.credential_access
-  - attack.t1110.003""",
-                "key_indices": {fail_list[0][0]} | {i for i, _ in success_hits},
-                "evidence_summary": [
-                    f"{len(fail_list)} Event 4625 failures from {ip} across {len(distinct_users)} distinct user(s)",
-                    f"{len(success_hits)} subsequent Event 4624 success(es) from {ip}",
-                ],
-                "caveats": [
-                    "Misconfigured service or scheduled task credentials on a single host typically fail repeatedly on 1 account, whereas spraying targets many distinct accounts."
-                ],
-                "questions": questions,
-            })
-
-    if candidates:
-        candidates.sort(key=lambda c: c["score"], reverse=True)
-        return candidates[0]
-
-    # ── FALLBACK: General Incident Triage (When No Known Attack Signature Matches)
-    ev_counter = Counter(ev["event_id"] for ev in events if ev["event_id"])
-    top_ev_id = str(ev_counter.most_common(1)[0][0]) if ev_counter else "4624"
-    hosts = [ev["target_host"] for ev in events if ev["target_host"]]
-    primary_host = hosts[0] if hosts else None
-
-    fallback_questions = [
-        {
-            "question_text": "[Phase 1: Telemetry Inventory] Which Windows Event ID occurs most frequently in this log capture?",
-            "correct_answer": top_ev_id,
-            "acceptable_answers": [top_ev_id],
-            "explanation": f"Event ID {top_ev_id} is the highest-volume event in the dataset ({ev_counter.get(int(top_ev_id), 0)} occurrences).",
-            "points": 15,
-        }
-    ]
-    if primary_host:
-        fallback_questions.append({
-            "question_text": "[Phase 2: Endpoint Identification] What is the primary hostname recorded in the event logs?",
-            "correct_answer": primary_host,
-            "acceptable_answers": list({primary_host.lower(), primary_host.split(".")[0].lower()}),
-            "explanation": f"The logs were generated by host '{primary_host}'.",
-            "points": 15,
-        })
-
-    return {
-        "score": 40,
-        "confidence": "General Triage (No Pre-Configured Attack Signature Matched)",
-        "name": f"Windows Event Log Triage ({primary_host or 'Endpoint Capture'})",
-        "mitre_technique": "T1078",
-        "severity": "Medium",
-        "alert_title": "Medium Severity: Unclassified Windows Telemetry Anomalies for Analyst Review",
-        "description": (
-            f"Ingested {len(events)} Windows event logs. No deterministic high-confidence attack signature "
-            "matched automatically. Review the extracted environment telemetry, customize the investigation "
-            "questions below, and verify any suspicious activity before publishing."
-        ),
-        "sigma_rule": f"""title: Custom Windows Event Triage (Event {top_ev_id})
-status: experimental
-logsource:
-  product: windows
-detection:
-  selection:
-    EventID: {top_ev_id}
-  condition: selection
-level: medium""",
-        "key_indices": set(),
-        "evidence_summary": [
-            f"Analyzed {len(events)} events across {len(ev_counter)} distinct Event IDs.",
-            "No built-in high-confidence attack rule matched; generated baseline triage draft for Admin customization.",
-        ],
-        "caveats": [
-            "Review the logs and customize the questions/answers before publishing this scenario to trainees."
-        ],
-        "questions": fallback_questions,
-    }
-
-
-def smart_curate_events(events: list[dict], key_indices: set[int], target_count: int = 350) -> list[dict]:
-    """
-    Guarantees 100% of matched key evidence events are preserved, fills up to 75% with
-    high-priority security Event IDs, and samples background noise chronologically.
-    """
-    total = len(events)
-    for idx, ev in enumerate(events):
-        ev["is_key_evidence"] = (idx in key_indices)
-
-    if total <= target_count:
-        return events
-
-    key_records = [(idx, ev) for idx, ev in enumerate(events) if idx in key_indices]
-    priority_records = [
-        (idx, ev) for idx, ev in enumerate(events)
-        if idx not in key_indices and ev["event_id"] in PRIORITY_EVENT_IDS
-    ]
-    bg_records = [
-        (idx, ev) for idx, ev in enumerate(events)
-        if idx not in key_indices and ev["event_id"] not in PRIORITY_EVENT_IDS
-    ]
-
-    remaining_after_keys = max(0, target_count - len(key_records))
-    max_priority = int(remaining_after_keys * 0.75)
-
-    if len(priority_records) > max_priority and max_priority > 0:
-        step = max(1, len(priority_records) // max_priority)
-        chosen_priority = priority_records[::step][:max_priority]
-    else:
-        chosen_priority = priority_records[:max_priority]
-
-    remaining_bg = max(0, target_count - len(key_records) - len(chosen_priority))
-    if remaining_bg > 0 and bg_records:
-        step_bg = max(1, len(bg_records) // remaining_bg)
-        chosen_bg = bg_records[::step_bg][:remaining_bg]
-    else:
-        chosen_bg = []
-
-    combined = sorted(key_records + chosen_priority + chosen_bg, key=lambda x: x[0])
-    return [x[1] for x in combined]
-
-
-def analyze_zip_archive(content: bytes, target_sample_count: int = 350) -> dict[str, Any]:
-    """Full pipeline entrypoint: intake -> normalize all -> detect & correlate -> extract AD -> draft."""
-    events, files_processed = stream_and_normalize_zip(content)
-    if not events:
-        raise ValueError("No valid JSON or JSONL Windows event records were found inside the ZIP archive.")
-
-    detection = evaluate_detection_rules(events)
-    ad_context = extract_observed_ad_context(events)
-    curated = smart_curate_events(events, detection["key_indices"], target_sample_count)
-
-    return {
-        "files_processed": files_processed,
-        "total_events_in_archive": len(events),
-        "curated_events_count": len(curated),
-        "key_evidence_count": len(detection["key_indices"]),
-        "confidence": detection["confidence"],
-        "evidence_summary": detection["evidence_summary"],
-        "caveats": detection["caveats"],
-        "draft": {
-            "name": detection["name"],
-            "description": detection["description"],
-            "mitre_technique": detection["mitre_technique"],
-            "status": "Draft",
-            "alert_title": detection["alert_title"],
-            "alert_severity": detection["severity"],
-            "sigma_rule": detection["sigma_rule"],
-            "ad_context": ad_context,
-            "questions": detection["questions"],
-        },
-        "curated_events": curated,
-    }
-File 2: Add /api/admin/analyze-zip and Connect upload_logs in threattrail-backend/main.pyIn threattrail-backend/main.py, import analyze_zip_archive from zip_analyzer and replace upload_logs + add analyze_zip_endpoint:   Pythonfrom zip_analyzer import analyze_zip_archive
-
-@app.post("/api/admin/analyze-zip")
-async def analyze_zip_endpoint(
-    file: UploadFile = File(...),
-    admin: User = Depends(require_admin),
-):
-    """
-    Streams and analyzes 100% of events in an uploaded .zip archive, returning
-    confidence-scored findings, observed AD context, and evidence-backed draft questions
-    for Admin review before saving.
-    """
-    if not file.filename or not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip archives are supported")
-
-    content = await file.read()
-    try:
-        report = analyze_zip_archive(content, target_sample_count=350)
-        # Exclude raw curated_events array from the lightweight form-preview response
-        return {k: v for k, v in report.items() if k != "curated_events"}
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="Invalid or corrupted .zip archive")
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"ZIP analysis failed: {str(e)}")
-
-
-@app.post("/api/admin/scenarios/{scenario_id}/upload-logs")
-async def upload_logs(
+1. Audit of Your Current Implementation vs. Why Those 3 Issues HappenedI inspected your updated repository in `` and traced each of the three issues across the frontend and backend:Area CheckedStatus in Current CodebaseRoot Cause of the Issue You ExperiencedP0–P2 Core Fixes (Single backend, is_key_evidence in LogOut, Search icon import, IP sanitization, duplicate question_id fix)✅ Done & VerifiedWorking as expected.Issue 1: Clicking "Verify" on a question does nothing / shows no feedback❌ Silent Error & Missing CSS1. In Investigation.jsx (handleVerifyFinding), the catch (err) block only runs console.error('Failed to verify finding:', err) without updating verifyStatus. If the backend endpoint returns an error or unexpected payload shape, the button flashes "Checking..." and reverts to "Verify" with zero visual feedback.   2. In App.css, the styles for .verify-feedback-msg, .msg-success, .msg-error, .btn-verify-finding, .inv-input-correct, and .inv-input-incorrect were never added to the stylesheet, so even when feedback renders, it lacks distinct success/error visual styling.   3. Typing a new answer into the input did not clear the previous verifyStatus for that question.   Issue 2: Admin cannot create/edit Hints or Acceptable Answer Aliases❌ Missing Admin Form Controls & Schema FieldsIn Investigation.jsx, trainees can click 🎁 Free Hint (is_free=true) and 💡 Unlock Forensic Hint (-15 pts) (is_free=false). However, in Admin.jsx (createQuestions and editQuestions), each question only has inputs for Question Prompt, Expected Answer, Points, and Debrief Explanation. There are no inputs in Admin.jsx for Free Starter Hint, Paid Forensic Hint, or Acceptable Answer Aliases (acceptable_answers).   Issue 3: "Incident Containment Playbook" is unexplained and Admin has no control over it❌ Disconnected UI WidgetIn Investigation.jsx, the Incident Containment Playbook asks the analyst to select a target host and compromised account to quarantine, but:1. Admin.jsx has no fields to configure (or disable) the expected Containment Host and Compromised Account.   2. main.py (submit_answers) and Report.jsx were not grading those dropdown selections or showing the analyst whether they quarantined the right target or caused a false-positive outage.   2. How the Fixed System Works (Admin Side $\leftrightarrow$ Analyst Side)Instant "Verify" Feedback & Diagnostic Coaching:Clicking Verify in Investigation.jsx now always displays a high-contrast banner directly under the question:Green (✓ Verified): Confirms the answer is right and locks in the green border.Amber (⚠️ Analyst Trap Detected): Explains why the value is a false positive (e.g., entering a $ machine account, SYSTEM, krbtgt, or 0x12 AES instead of 0x17 RC4).Red (✗ Incorrect Finding): Shows the failed attempt counter (Attempt 1/2 — Forensic hint unlocks after 2 failed attempts) or any server error message so it never fails silently.Full Admin Control Over Hints & Aliases (Admin.jsx):Every question in Create New Scenario and Edit Scenario now has inputs for:Acceptable Aliases (comma-separated) (e.g., corp\svc_backup, svc_backup@corp.local)🎁 Free Starter Hint (0 pts penalty) (e.g., "Filter by Event ID 4662 and check the SubjectUserName field.")💡 Paid Forensic Hint (-15 pts penalty) (e.g., "Look for the Event 4662 record where SubjectUserName does NOT end with '$' and Properties contains 1131f6ad...")📋 Post-Submission Debrief ExplanationWhen an Admin uses ⚡ Analyze .ZIP & Populate Draft, the analyzer automatically generates both the Free Starter Hint and the Paid Forensic Hint for every generated question so the Admin doesn't have to write them from scratch unless they want to customize them.Clear, Optional Incident Containment Playbook (Admin + Analyst + Report):What it is: In a real SOC, after identifying the attack in the logs, the analyst executes a containment action (isolating the compromised host and disabling the compromised user account).How Admin controls it: In Admin.jsx (Step 2), there is now an explicit "🛡️ Incident Containment Playbook Targets (Optional)" box with two fields: Expected Host to Isolate and Expected Account to Disable.The .zip Auto-Analyzer populates these two fields automatically from the key attack logs.If the Admin leaves both fields blank, the Containment Playbook is hidden for that scenario. If filled, Investigation.jsx displays the Containment Playbook card and Report.jsx grades whether the analyst quarantined the right host/account (or accidentally isolated a benign Domain Controller / SYSTEM account).3. Step-by-Step Code FixesStep 1: Update threattrail-backend/models.py & threattrail-backend/schemas.pyIn threattrail-backend/models.py, add free_hint and hint to the Question model (lines 84–96):   Pythonclass Question(Base):
+    __tablename__ = "questions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id"), nullable=False, index=True)
+    question_text = Column(Text, nullable=False)
+    correct_answer = Column(String(300), nullable=False)
+    acceptable_answers = Column(JSONType, nullable=True, default=list)
+    free_hint = Column(Text, nullable=True)
+    hint = Column(Text, nullable=True)
+    explanation = Column(Text, nullable=True)
+    points = Column(Integer, default=10, nullable=False)
+
+    scenario = relationship("Scenario", back_populates="questions")
+In threattrail-backend/schemas.py, update QuestionAdminOut, QuestionCreate, SubmissionRequest, and SubmissionResponse so hints and containment selections flow cleanly between Admin, Analyst, and Report:   Pythonclass QuestionAdminOut(BaseModel):
+    id: int
+    scenario_id: int
+    question_text: str
+    correct_answer: str
+    acceptable_answers: Optional[list[str]] = Field(default_factory=list)
+    free_hint: Optional[str] = None
+    hint: Optional[str] = None
+    explanation: Optional[str] = None
+    points: int = 10
+
+    model_config = {"from_attributes": True}
+
+
+class QuestionCreate(BaseModel):
+    question_text: str
+    correct_answer: str
+    acceptable_answers: Optional[list[str]] = Field(default_factory=list)
+    free_hint: Optional[str] = None
+    hint: Optional[str] = None
+    explanation: Optional[str] = None
+    points: int = 10
+
+
+class VerifyFindingRequest(BaseModel):
+    question_id: int
+    answer: str
+
+
+class VerifyFindingResponse(BaseModel):
+    question_id: int
+    is_correct: bool
+    trap_detected: bool = False
+    message: str
+
+
+class SubmissionRequest(BaseModel):
+    answers: list[AnswerSubmission]
+    pinned_log_ids: Optional[list[int]] = Field(default_factory=list)
+    hints_used: Optional[list[int]] = Field(default_factory=list)
+    free_hint_id: Optional[int] = None
+    free_hints_used: Optional[list[int]] = Field(default_factory=list)
+    trials_count: Optional[int] = 1
+    user_guesses: Optional[dict[str, list[str]]] = Field(default_factory=dict)
+    containment_host: Optional[str] = None
+    containment_user: Optional[str] = None
+
+
+class ContainmentResult(BaseModel):
+    enabled: bool = False
+    expected_host: Optional[str] = None
+    selected_host: Optional[str] = None
+    host_correct: Optional[bool] = None
+    expected_user: Optional[str] = None
+    selected_user: Optional[str] = None
+    user_correct: Optional[bool] = None
+    feedback: Optional[str] = None
+
+
+class SubmissionResponse(BaseModel):
+    scenario_id: int
+    total_questions: int
+    correct_count: int
+    total_points: int = 0
+    points_earned: int = 0
+    hint_penalty: int = 0
+    score_percent: int
+    pinned_log_ids: list[int] = Field(default_factory=list)
+    key_evidence_log_ids: list[int] = Field(default_factory=list)
+    containment_eval: Optional[ContainmentResult] = None
+    results: list[QuestionResult]
+Step 2: Update threattrail-backend/main.py (Verify-Finding, Hints, Auto-Migration & Containment Grading)In threattrail-backend/main.py, ensure the startup hook auto-adds free_hint and hint columns if they don't exist yet in your database, and ensure /verify-finding, /hint, create_scenario_full, full_update_scenario, and submit_answers include all fields:   Pythonfrom sqlalchemy import text
+from schemas import VerifyFindingRequest, VerifyFindingResponse, ContainmentResult
+
+@app.on_event("startup")
+def on_startup():
+    """Create all tables and safely add any new columns to existing SQLite/Postgres tables."""
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as conn:
+        for col_name in ("free_hint", "hint"):
+            try:
+                conn.execute(text(f"ALTER TABLE questions ADD COLUMN {col_name} TEXT"))
+            except Exception:
+                pass
+
+
+def generate_fallback_free_hint(question: Question) -> str:
+    """Generates a gentle starter pointer if the admin left free_hint blank."""
+    if question.free_hint and question.free_hint.strip():
+        return question.free_hint.strip()
+    q_low = (question.question_text or "").lower()
+    if "event id" in q_low:
+        return "Starter Clue: Click 'View Sigma Rule' in the top alert banner or check the 'Event Cheat Sheet' tab to match the activity to its Windows Event ID."
+    if "source ip" in q_low or "client" in q_low or "ip address" in q_low:
+        return "Starter Clue: Check the 'Suspect IPs' quick-filter bar or expand the relevant authentication/network event in the Log Inspector to check the Source IP field."
+    if "account" in q_low or "user" in q_low or "subjectusername" in q_low:
+        return "Starter Clue: Expand the matching event row to open the Forensic Triage View, then inspect 'Identity & Session Context' (ignore machine accounts ending in '$')."
+    if "host" in q_low or "workstation" in q_low or "computer" in q_low:
+        return "Starter Clue: Look at the 'Target Host' column on the suspicious event row or check the 'AD Environment' tab."
+    if "mitre" in q_low:
+        return "Starter Clue: Check the top SIEM Alert Banner or the tags section at the bottom of the Sigma Detection Rule."
+    return "Starter Clue: Filter the logs using the Event IDs mentioned in the Sigma Rule, then expand the suspicious event to inspect its decoded fields."
+
+
+def generate_fallback_paid_hint(question: Question) -> str:
+    """Generates a detailed forensic walkthrough if the admin left paid hint blank."""
+    if question.hint and question.hint.strip():
+        return question.hint.strip()
+    if question.explanation and question.explanation.strip():
+        return f"Forensic Walkthrough: {question.explanation.strip()}"
+    ans = (question.correct_answer or "").strip()
+    masked = ans[:2] + "***" + (ans[-1] if len(ans) > 3 else "")
+    return f"Forensic Walkthrough: Search the logs for indicators matching pattern '{masked}' (length: {len(ans)} chars)."
+
+
+@app.post("/api/scenarios/{scenario_id}/verify-finding", response_model=VerifyFindingResponse)
+def verify_finding(
     scenario_id: int,
-    file: UploadFile = File(...),
+    body: VerifyFindingRequest,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
     scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
 
-    if not file.filename or not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Only .zip files are supported")
+    question = (
+        db.query(Question)
+        .filter(Question.id == body.question_id, Question.scenario_id == scenario_id)
+        .first()
+    )
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found in this scenario")
 
-    content = await file.read()
-    try:
-        analysis = analyze_zip_archive(content, target_sample_count=350)
-        curated_events = analysis["curated_events"]
+    is_correct = is_answer_match(body.answer, question.correct_answer, question.acceptable_answers)
+    if is_correct:
+        return VerifyFindingResponse(
+            question_id=question.id,
+            is_correct=True,
+            trap_detected=False,
+            message="Verified! Your finding matches the forensic evidence in the logs.",
+        )
 
-        log_entries = [
-            Log(
-                scenario_id=scenario_id,
-                event_id=ev["event_id"],
-                timestamp=ev["timestamp"],
-                source_ip=ev["source_ip"],
-                username=ev["username"],
-                target_host=ev["target_host"],
-                is_key_evidence=bool(ev.get("is_key_evidence", False)),
-                raw_event_data=ev["raw"],
-            )
-            for ev in curated_events
-        ]
+    trap_msg = diagnose_analyst_mistake(body.answer, question, scenario)
+    if trap_msg:
+        return VerifyFindingResponse(
+            question_id=question.id,
+            is_correct=False,
+            trap_detected=True,
+            message=trap_msg,
+        )
 
-        # If scenario had no ad_context yet, populate it with observed telemetry
-        if not scenario.ad_context:
-            scenario.ad_context = analysis["draft"]["ad_context"]
+    return VerifyFindingResponse(
+        question_id=question.id,
+        is_correct=False,
+        trap_detected=False,
+        message=f"'{body.answer.strip()}' does not match the expected indicator. Re-check the Log Inspector fields or use a Free Hint.",
+    )
 
-        db.query(Log).filter(Log.scenario_id == scenario_id).delete()
-        db.add_all(log_entries)
-        db.commit()
 
-        return {
-            "status": "success",
-            "total_in_archive": analysis["total_events_in_archive"],
-            "logs_inserted": len(log_entries),
-            "key_evidence_count": analysis["key_evidence_count"],
-            "message": (
-                f"Analyzed {analysis['total_events_in_archive']} total events and curated "
-                f"{len(log_entries)} logs ({analysis['key_evidence_count']} key evidence events preserved)."
-            ),
-        }
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="Invalid zip file format")
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Log ingestion error: {str(e)}")
-File 3: Upgrade threattrail-frontend/src/pages/Admin.jsx (Auto-Analyze Banner, Evidence Summary & Editable ad_context)In threattrail-frontend/src/pages/Admin.jsx:   Add state hooks for the ZIP Analyzer and ad_context JSON (right below createFile / editSigmaRule around lines 52–74):   JavaScript  const [createAdContext, setCreateAdContext] = useState('{}')
-  const [isAnalyzingZip, setIsAnalyzingZip] = useState(false)
-  const [zipAnalysisReport, setZipAnalysisReport] = useState(null)
-  const [editAdContext, setEditAdContext] = useState('{}')
-Add the handleAnalyzeZipFile handler in Admin.jsx (right above handleCreateSubmit around line 255):   JavaScript  const handleAnalyzeZipFile = async (selectedFile) => {
-    const fileToAnalyze = selectedFile || createFile
-    if (!fileToAnalyze) {
-      showToast('Please select a .zip log archive first.', 'error')
+@app.post("/api/scenarios/{scenario_id}/questions/{question_id}/hint")
+def get_question_hint(
+    scenario_id: int,
+    question_id: int,
+    is_free: bool = Query(False),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    question = (
+        db.query(Question)
+        .filter(Question.id == question_id, Question.scenario_id == scenario_id)
+        .first()
+    )
+    if not question:
+        raise HTTPException(status_code=404, detail="Question not found")
+
+    hint_text = generate_fallback_free_hint(question) if is_free else generate_fallback_paid_hint(question)
+    return {
+        "question_id": question.id,
+        "is_free": is_free,
+        "penalty": 0 if is_free else 15,
+        "hint": hint_text,
+    }
+Also in threattrail-backend/main.py:   Inside create_scenario_full (line 403) and full_update_scenario (line 459), pass free_hint=q.free_hint and hint=q.hint when creating Question(...) objects:Python                db.add(Question(
+                    scenario_id=sc.id,
+                    question_text=q.question_text.strip(),
+                    correct_answer=q.correct_answer.strip(),
+                    acceptable_answers=q.acceptable_answers or [],
+                    free_hint=q.free_hint,
+                    hint=q.hint,
+                    explanation=q.explanation,
+                    points=q.points or 10,
+                ))
+Inside submit_answers (main.py lines 246–328), add the hint penalty calculation and Incident Containment Playbook evaluation right before returning SubmissionResponse:   Python    # Apply paid hint penalty (-15 pts per unique paid hint used)
+    unique_paid_hints = set(body.hints_used or [])
+    hint_penalty = len(unique_paid_hints) * 15
+    points_earned = max(0, points_earned - hint_penalty)
+
+    total = len(questions)
+    score_percent = round((points_earned / total_points) * 100) if total_points > 0 else 0
+
+    # Evaluate Incident Containment Playbook if configured on the scenario
+    ad_ctx = scenario.ad_context or {}
+    containment_cfg = ad_ctx.get("containment_targets") or {}
+    expected_host = (containment_cfg.get("isolate_host") or "").strip()
+    expected_user = (containment_cfg.get("disable_user") or "").strip()
+
+    containment_eval = None
+    if expected_host or expected_user:
+        sel_host = (body.containment_host or "").strip()
+        sel_user = (body.containment_user or "").strip()
+
+        host_ok = is_answer_match(sel_host, expected_host, [expected_host.split(".")[0]]) if expected_host else True
+        user_ok = is_answer_match(sel_user, expected_user) if expected_user else True
+
+        feedback_parts = []
+        if expected_host:
+            if host_ok:
+                feedback_parts.append(f"✅ Host Isolation Correct: Isolated '{sel_host}'.")
+            elif not sel_host:
+                feedback_parts.append(f"⚠️ Missed Host Isolation: Expected '{expected_host}' to be isolated.")
+            else:
+                feedback_parts.append(f"❌ False-Positive Host Isolation: You isolated '{sel_host}' instead of '{expected_host}'.")
+        if expected_user:
+            if user_ok:
+                feedback_parts.append(f"✅ Account Containment Correct: Disabled '{sel_user}'.")
+            elif not sel_user:
+                feedback_parts.append(f"⚠️ Missed Account Containment: Expected '{expected_user}' to be disabled.")
+            elif sel_user.upper() in ("SYSTEM", "LOCAL SYSTEM") or sel_user.endswith("$"):
+                feedback_parts.append(f"❌ Critical SOC Mistake: Disabling '{sel_user}' (a built-in OS or machine '$' account) causes severe production outage! Target the compromised user '{expected_user}'.")
+            else:
+                feedback_parts.append(f"❌ Wrong Account Disabled: You disabled '{sel_user}' instead of '{expected_user}'.")
+
+        containment_eval = ContainmentResult(
+            enabled=True,
+            expected_host=expected_host or None,
+            selected_host=sel_host or None,
+            host_correct=host_ok if expected_host else None,
+            expected_user=expected_user or None,
+            selected_user=sel_user or None,
+            user_correct=user_ok if expected_user else None,
+            feedback=" ".join(feedback_parts),
+        )
+And pass hint_penalty=hint_penalty and containment_eval=containment_eval into SubmissionResponse(...).Step 3: Update threattrail-backend/zip_analyzer.py to Auto-Populate Hints & Containment TargetsIn threattrail-backend/zip_analyzer.py, inside analyze_zip_archive(content, target_sample_count=350), add free_hint and hint to each generated question and populate ad_context["containment_targets"] automatically from the detected attack evidence:Python    # Inside analyze_zip_archive() in zip_analyzer.py, right after `ad_context = extract_observed_ad_context(events)`:
+    key_evs = [events[i] for i in sorted(detection["key_indices"])] if detection["key_indices"] else events[:5]
+    inferred_host = next((e["target_host"] for e in key_evs if e.get("target_host")), "")
+    inferred_user = next(
+        (
+            (e["target_user"] or e["subject_user"] or e["username"]).split("\\")[-1].split("@")[0]
+            for e in key_evs
+            if (e.get("target_user") or e.get("subject_user") or e.get("username"))
+            and not str(e.get("target_user") or e.get("subject_user") or e.get("username")).endswith("$")
+            and str(e.get("target_user") or e.get("subject_user") or e.get("username")).upper() not in ("SYSTEM", "ANONYMOUS LOGON")
+        ),
+        "",
+    )
+    ad_context["containment_targets"] = {
+        "isolate_host": inferred_host,
+        "disable_user": inferred_user,
+    }
+
+    # Ensure every auto-generated question has both a Free Starter Hint and a Paid Forensic Hint
+    for q in detection["questions"]:
+        q.setdefault(
+            "free_hint",
+            "Filter by the Event ID in the Sigma Rule and expand the suspicious event in the Log Inspector.",
+        )
+        q.setdefault(
+            "hint",
+            q.get("explanation") or f"Inspect the key evidence event fields for '{q['correct_answer']}'.",
+        )
+Step 4: Fix threattrail-frontend/src/pages/Investigation.jsx (Visible Verify Feedback + Dynamic Containment Playbook)In threattrail-frontend/src/pages/Investigation.jsx:   Fix handleAnswerChange and handleVerifyFinding (around lines 240–280) so typing clears stale status and clicking Verify always sets a visible status message (even if an error occurs):   JavaScript  const handleAnswerChange = (qId, val) => {
+    setAnswers((prev) => ({ ...prev, [qId]: val }))
+    // Clear stale verification message when the analyst edits their answer
+    if (verifyStatus[qId]) {
+      setVerifyStatus((prev) => {
+        const next = { ...prev }
+        delete next[qId]
+        return next
+      })
+    }
+  }
+
+  const handleVerifyFinding = async (questionId) => {
+    const answer = (answers[questionId] || '').trim()
+    if (!answer) {
+      setVerifyStatus((prev) => ({
+        ...prev,
+        [questionId]: {
+          correct: false,
+          trap: false,
+          message: 'Please enter a finding before clicking Verify.',
+        },
+      }))
       return
     }
-    setIsAnalyzingZip(true)
-    setCreateError('')
-    try {
-      const formData = new FormData()
-      formData.append('file', fileToAnalyze)
-      const res = await api.post('/admin/analyze-zip', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      })
-      const data = res.data
-      const draft = data.draft
 
-      setZipAnalysisReport(data)
-      setCreateName(draft.name || '')
-      setCreateDesc(draft.description || '')
-      setCreateMitre(draft.mitre_technique || '')
-      setCreateStatus(draft.status || 'Draft')
-      setCreateAlertTitle(draft.alert_title || '')
-      setCreateAlertSeverity(draft.alert_severity || 'High')
-      setCreateSigmaRule(draft.sigma_rule || '')
-      setCreateAdContext(JSON.stringify(draft.ad_context || {}, null, 2))
+    setVerifyingId(questionId)
+    try {
+      const res = await api.post(`/scenarios/${scenarioId}/verify-finding`, {
+        question_id: questionId,
+        answer: answer,
+      })
+      const isCorrect = Boolean(res.data?.is_correct ?? res.data?.correct)
+      const isTrap = Boolean(res.data?.trap_detected)
+      const feedbackMsg =
+        res.data?.message ||
+        (isCorrect
+          ? 'Verified! Your finding matches the forensic evidence.'
+          : 'Incorrect finding. Re-check the Log Inspector fields or use a hint.')
+
+      setQuestionGuesses((prev) => ({
+        ...prev,
+        [questionId]: [...(prev[questionId] || []), answer],
+      }))
+
+      if (!isCorrect) {
+        setTrialsCount((prev) => ({
+          ...prev,
+          [questionId]: (prev[questionId] || 0) + 1,
+        }))
+      }
+
+      setVerifyStatus((prev) => ({
+        ...prev,
+        [questionId]: {
+          correct: isCorrect,
+          trap: isTrap,
+          message: feedbackMsg,
+        },
+      }))
+    } catch (err) {
+      const errMsg =
+        err.response?.data?.detail ||
+        err.message ||
+        'Verification request failed. Check that the backend server is running.'
+      setVerifyStatus((prev) => ({
+        ...prev,
+        [questionId]: {
+          correct: false,
+          trap: false,
+          message: `⚠️ Verification Error: ${errMsg}`,
+        },
+      }))
+    } finally {
+      setVerifyingId(null)
+    }
+  }
+Include containment_host and containment_user in handleSubmit (Investigation.jsx line 320):   JavaScript      const payload = {
+        answers: questions.map((q) => ({
+          question_id: q.id,
+          answer: answers[q.id] || '',
+        })),
+        pinned_log_ids: pinnedLogIds,
+        hints_used: hintsUsed,
+        free_hint_id: freeHintsUsed[0] || null,
+        free_hints_used: freeHintsUsed,
+        trials_count: totalTrials,
+        user_guesses: questionGuesses,
+        containment_host: containmentHost || null,
+        containment_user: containmentUser || null,
+      }
+Render the Incident Containment Playbook cleanly right above the Submit button in Investigation.jsx (only when containment targets or hosts/users exist, with clear analyst instructions):JavaScript            {/* ── Incident Containment Playbook (Connected to Admin Containment Targets) ── */}
+            {(distinctHosts.length > 0 || distinctUsers.length > 0) && (
+              <div className="containment-playbook-card">
+                <div className="containment-playbook-header">
+                  <ShieldAlert size={16} color="#f59e0b" />
+                  <div>
+                    <h4>Incident Response & Containment Playbook</h4>
+                    <p>
+                      Final Triage Action: Based on the evidence you uncovered, select the compromised host to isolate from the domain and the compromised user account to disable. (Avoid isolating uninvolved servers or disabling built-in <code>SYSTEM</code> / <code>$</code> machine accounts!)
+                    </p>
+                  </div>
+                </div>
+
+                <div className="containment-select-grid">
+                  <div className="containment-field">
+                    <label>1. Endpoint to Isolate (Quarantine Host)</label>
+                    <select
+                      className="answer-input"
+                      value={containmentHost}
+                      onChange={(e) => setContainmentHost(e.target.value)}
+                    >
+                      <option value="">-- Select Compromised Host to Isolate --</option>
+                      {distinctHosts.map((h) => (
+                        <option key={h} value={h}>{h}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="containment-field">
+                    <label>2. Account to Disable / Reset Password</label>
+                    <select
+                      className="answer-input"
+                      value={containmentUser}
+                      onChange={(e) => setContainmentUser(e.target.value)}
+                    >
+                      <option value="">-- Select Compromised Account to Disable --</option>
+                      {distinctUsers.map((u) => (
+                        <option key={u} value={u}>{u}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
+            )}
+Step 5: Upgrade threattrail-frontend/src/pages/Admin.jsx (Hint Inputs, Acceptable Aliases & Containment Target Controls)In threattrail-frontend/src/pages/Admin.jsx:   Add state for Containment Targets and Question Hints in Admin.jsx:JavaScript  // Inside Admin() state declarations:
+  const [createContainmentHost, setCreateContainmentHost] = useState('')
+  const [createContainmentUser, setCreateContainmentUser] = useState('')
+  const [createQuestions, setCreateQuestions] = useState([
+    { q: '', a: '', acceptable_answers: '', free_hint: '', hint: '', explanation: '', points: 10 }
+  ])
+
+  const [editContainmentHost, setEditContainmentHost] = useState('')
+  const [editContainmentUser, setEditContainmentUser] = useState('')
+When handleAnalyzeZipFile runs in Admin.jsx, populate the new Hint fields and Containment Target inputs automatically:JavaScript      const adCtx = draft.ad_context || {}
+      const targets = adCtx.containment_targets || {}
+      setCreateContainmentHost(targets.isolate_host || '')
+      setCreateContainmentUser(targets.disable_user || '')
+      setCreateAdContext(JSON.stringify(adCtx, null, 2))
 
       if (draft.questions && draft.questions.length > 0) {
         setCreateQuestions(
           draft.questions.map((q) => ({
-            q: q.question_text,
-            a: q.correct_answer,
-            acceptable_answers: q.acceptable_answers || [],
+            q: q.question_text || '',
+            a: q.correct_answer || '',
+            acceptable_answers: Array.isArray(q.acceptable_answers) ? q.acceptable_answers.join(', ') : '',
+            free_hint: q.free_hint || '',
+            hint: q.hint || '',
             explanation: q.explanation || '',
             points: q.points || 10,
           }))
         )
       }
-      showToast(
-        `Analyzed ${data.total_events_in_archive.toLocaleString()} events! Review the draft below before saving.`
-      )
-    } catch (err) {
-      setCreateError(err.response?.data?.detail || 'Failed to analyze ZIP archive')
-      showToast(err.response?.data?.detail || 'ZIP analysis failed', 'error')
-    } finally {
-      setIsAnalyzingZip(false)
-    }
-  }
-Include ad_context and acceptable_answers in handleCreateSubmit and handleSaveEdit:   In handleCreateSubmit, parse createAdContext:JavaScriptlet parsedAdContext = {}
-try {
-  parsedAdContext = createAdContext.trim() ? JSON.parse(createAdContext) : {}
-} catch {
-  throw new Error('Observed AD Environment JSON is not valid JSON.')
-}
-And pass ad_context: parsedAdContext in api.post('/admin/scenarios/full', ...) along with acceptable_answers: q.acceptable_answers || [] on each question.   In openEditModal, populate setEditAdContext(JSON.stringify(detail.ad_context || {}, null, 2)), and in handleSaveEdit, include ad_context: JSON.parse(editAdContext || '{}') in payload.   Place the Auto-Analyze .zip Card at the top of the activeTab === 'create' form in Admin.jsx:   JavaScript            {/* STEP 0: EVIDENCE-DRIVEN ZIP AUTO-ANALYZER */}
-            <div className="form-section-card" style={{ borderColor: 'rgba(0, 255, 204, 0.35)' }}>
-              <div className="section-title">
-                <span className="step-num" style={{ background: '#00ffcc', color: '#0f172a' }}>⚡</span>
-                <div>
-                  <h4>Evidence-Driven .ZIP Log Analyzer & Draft Generator</h4>
-                  <p style={{ fontSize: '0.82rem', color: 'var(--text-dim)', margin: 0 }}>
-                    Upload a Windows Event / Sysmon .zip archive to scan 100% of events, extract observed Active Directory telemetry, and auto-populate an evidence-backed scenario draft for your review.
+In handleCreateSubmit and handleSaveEdit in Admin.jsx, merge containment_targets into ad_context and send free_hint, hint, and parsed acceptable_answers on every question:JavaScript      let parsedAdContext = {}
+      try {
+        parsedAdContext = createAdContext.trim() ? JSON.parse(createAdContext) : {}
+      } catch {
+        throw new Error('Observed AD Environment JSON is not valid JSON.')
+      }
+      if (createContainmentHost.trim() || createContainmentUser.trim()) {
+        parsedAdContext.containment_targets = {
+          isolate_host: createContainmentHost.trim(),
+          disable_user: createContainmentUser.trim(),
+        }
+      }
+
+      const validQuestions = createQuestions
+        .filter((q) => q.q.trim() && q.a.trim())
+        .map((q) => ({
+          question_text: q.q.trim(),
+          correct_answer: q.a.trim(),
+          acceptable_answers: typeof q.acceptable_answers === 'string'
+            ? q.acceptable_answers.split(',').map((s) => s.trim()).filter(Boolean)
+            : (q.acceptable_answers || []),
+          free_hint: q.free_hint?.trim() || null,
+          hint: q.hint?.trim() || null,
+          explanation: q.explanation?.trim() || null,
+          points: parseInt(q.points) || 10,
+        }))
+Render the Admin Controls for Containment Targets (in Step 2) and Question Hints (in Step 3 & Edit Modal) in Admin.jsx:   JavaScript              {/* Inside Step 2 of Create Scenario Form in Admin.jsx: */}
+              <div className="form-row" style={{ marginTop: 12, padding: 12, background: 'rgba(245, 158, 11, 0.06)', border: '1px solid rgba(245, 158, 11, 0.25)', borderRadius: 8 }}>
+                <div style={{ width: '100%', marginBottom: 4 }}>
+                  <strong style={{ color: '#fbbf24', fontSize: '0.86rem' }}>
+                    🛡️ Incident Containment Playbook Targets (Controls Analyst Containment Box)
+                  </strong>
+                  <p style={{ fontSize: '0.78rem', color: 'var(--text-dim)', margin: 0 }}>
+                    Specify which compromised host and user account the analyst should quarantine at the end of the investigation (auto-filled when analyzing a .zip, or leave blank to disable containment grading).
                   </p>
                 </div>
-              </div>
-
-              <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap', marginTop: 10 }}>
-                <input
-                  type="file"
-                  accept=".zip"
-                  onChange={(e) => {
-                    const f = e.target.files[0] || null
-                    setCreateFile(f)
-                    setZipAnalysisReport(null)
-                    if (f) handleAnalyzeZipFile(f)
-                  }}
-                />
-                <button
-                  type="button"
-                  className="btn btn-primary btn-sm"
-                  disabled={!createFile || isAnalyzingZip}
-                  onClick={() => handleAnalyzeZipFile(createFile)}
-                >
-                  {isAnalyzingZip ? 'Scanning Entire Archive...' : '⚡ Analyze .ZIP & Populate Draft'}
-                </button>
-              </div>
-
-              {zipAnalysisReport && (
-                <div style={{ marginTop: 14, padding: 14, background: 'rgba(15, 23, 42, 0.75)', borderRadius: 8, border: '1px solid rgba(56, 189, 248, 0.3)' }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
-                    <strong style={{ color: '#38bdf8' }}>
-                      📊 Telemetry Report: {zipAnalysisReport.total_events_in_archive.toLocaleString()} total events analyzed → {zipAnalysisReport.curated_events_count} curated ({zipAnalysisReport.key_evidence_count} key evidence)
-                    </strong>
-                    <span className="status-pill status-published" style={{ fontSize: '0.75rem' }}>
-                      {zipAnalysisReport.confidence}
-                    </span>
-                  </div>
-                  <ul style={{ margin: '6px 0', paddingLeft: 18, fontSize: '0.83rem', color: '#e2e8f0' }}>
-                    {zipAnalysisReport.evidence_summary.map((item, i) => (
-                      <li key={i}>{item}</li>
-                    ))}
-                  </ul>
-                  {zipAnalysisReport.caveats?.length > 0 && (
-                    <div style={{ marginTop: 8, fontSize: '0.8rem', color: '#fbbf24' }}>
-                      <strong>⚠️ Analyst Review Note:</strong> {zipAnalysisReport.caveats.join(' ')}
-                    </div>
-                  )}
+                <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                  <label>Expected Host to Isolate (e.g. MORDORDC.theshire.local)</label>
+                  <input
+                    className="admin-input"
+                    value={createContainmentHost}
+                    onChange={(e) => setCreateContainmentHost(e.target.value)}
+                    placeholder="Optional: Hostname to isolate"
+                  />
                 </div>
+                <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                  <label>Expected Compromised Account to Disable (e.g. pgustavo)</label>
+                  <input
+                    className="admin-input"
+                    value={createContainmentUser}
+                    onChange={(e) => setCreateContainmentUser(e.target.value)}
+                    placeholder="Optional: Username to disable"
+                  />
+                </div>
+              </div>
+And inside Step 3 (Questions) of Admin.jsx, replace the question input block so the Admin can control Acceptable Aliases, 🎁 Free Starter Hint, 💡 Paid Forensic Hint (-15 pts), and Debrief Explanation:   JavaScript              {createQuestions.map((q, idx) => (
+                <div key={idx} style={{ marginBottom: 16, padding: 14, background: 'rgba(255,255,255,0.02)', borderRadius: 8, border: '1px solid var(--border)' }}>
+                  <div className="question-input-row">
+                    <span className="q-index-pill">Q{idx + 1}</span>
+                    <input
+                      className="admin-input flex-2"
+                      placeholder="Question prompt..."
+                      value={q.q}
+                      onChange={(e) => handleCreateQuestionChange(idx, 'q', e.target.value)}
+                      required
+                    />
+                    <input
+                      className="admin-input flex-1"
+                      placeholder="Canonical Answer..."
+                      value={q.a}
+                      onChange={(e) => handleCreateQuestionChange(idx, 'a', e.target.value)}
+                      required
+                    />
+                    <input
+                      type="number"
+                      className="admin-input"
+                      style={{ width: 80 }}
+                      title="Question Points"
+                      value={q.points}
+                      onChange={(e) => handleCreateQuestionChange(idx, 'points', e.target.value)}
+                    />
+                    <button
+                      type="button"
+                      className="btn-remove-q"
+                      onClick={() => handleRemoveCreateQuestion(idx)}
+                    >
+                      ×
+                    </button>
+                  </div>
+
+                  <div className="form-row" style={{ marginTop: 8, marginBottom: 8 }}>
+                    <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: '0.76rem', color: '#94a3b8' }}>Acceptable Answer Aliases (comma-separated)</label>
+                      <input
+                        className="admin-input"
+                        placeholder="e.g., corp\svc_backup, svc_backup@corp.local"
+                        value={q.acceptable_answers || ''}
+                        onChange={(e) => handleCreateQuestionChange(idx, 'acceptable_answers', e.target.value)}
+                      />
+                    </div>
+                    <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: '0.76rem', color: '#34d399' }}>🎁 Free Starter Hint (0 pts penalty)</label>
+                      <input
+                        className="admin-input"
+                        placeholder="Starter pointer shown when trainee clicks Free Hint..."
+                        value={q.free_hint || ''}
+                        onChange={(e) => handleCreateQuestionChange(idx, 'free_hint', e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="form-row" style={{ marginBottom: 0 }}>
+                    <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: '0.76rem', color: '#fbbf24' }}>💡 Paid Forensic Hint (-15 pts penalty, unlocks after 2 wrong tries)</label>
+                      <input
+                        className="admin-input"
+                        placeholder="Detailed forensic walkthrough hint..."
+                        value={q.hint || ''}
+                        onChange={(e) => handleCreateQuestionChange(idx, 'hint', e.target.value)}
+                      />
+                    </div>
+                    <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: '0.76rem', color: '#60a5fa' }}>📋 Post-Submission Debrief Explanation</label>
+                      <input
+                        className="admin-input"
+                        placeholder="Shown on Report page after grading..."
+                        value={q.explanation || ''}
+                        onChange={(e) => handleCreateQuestionChange(idx, 'explanation', e.target.value)}
+                      />
+                    </div>
+                  </div>
+                </div>
+              ))}
+Step 6: Add the Missing Verification, Hint, and Containment Styles to threattrail-frontend/src/App.cssAppend these styles to the bottom of threattrail-frontend/src/App.css so the Verify button, Correct / Incorrect / Trap banners, Hints, and Containment Playbook render with clear, high-contrast feedback:   CSS/* ── Verification, Hint & Containment Playbook Styles ── */
+.inv-input-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-verify-finding {
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  background: rgba(59, 130, 246, 0.15);
+  color: #93c5fd;
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.btn-verify-finding:hover:not(:disabled) {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-verify-finding.verified {
+  background: rgba(34, 197, 94, 0.2);
+  border-color: #22c55e;
+  color: #4ade80;
+}
+
+.btn-verify-finding:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.inv-input-correct {
+  border-color: #22c55e !important;
+  background: rgba(34, 197, 94, 0.08) !important;
+}
+
+.inv-input-incorrect {
+  border-color: #ef4444 !important;
+  background: rgba(239, 68, 68, 0.08) !important;
+}
+
+.verify-feedback-msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  animation: cardFadeIn 0.2s ease;
+}
+
+.verify-feedback-msg.msg-success {
+  background: rgba(34, 197, 94, 0.12);
+  border: 1px solid rgba(34, 197, 94, 0.4);
+  color: #86efac;
+}
+
+.verify-feedback-msg.msg-error {
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+}
+
+.attempt-badge {
+  margin-left: auto;
+  background: rgba(0, 0, 0, 0.35);
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.q-label-meta-cluster {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.btn-free-hint-sm {
+  background: rgba(16, 185, 129, 0.12);
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  color: #34d399;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.btn-free-hint-sm:hover {
+  background: rgba(16, 185, 129, 0.22);
+}
+
+.free-hint-active-pill {
+  font-size: 0.7rem;
+  color: #34d399;
+  font-weight: 600;
+}
+
+.unlocked-hint-box {
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  color: #fde68a;
+}
+
+.unlocked-hint-box-free {
+  background: rgba(16, 185, 129, 0.08);
+  border-color: rgba(16, 185, 129, 0.35);
+  color: #a7f3d0;
+}
+
+.unlocked-hint-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.btn-unlock-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  justify-content: center;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.15);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #fbbf24;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.hint-locked-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.containment-playbook-card {
+  margin-top: 16px;
+  padding: 14px;
+  background: rgba(245, 158, 11, 0.06);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 8px;
+}
+
+.containment-playbook-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.containment-playbook-header h4 {
+  font-size: 0.88rem;
+  color: #fbbf24;
+  margin-bottom: 2px;
+}
+
+.containment-playbook-header p {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+.containment-select-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.containment-field label {
+  display: block;
+  font-size: 0.76rem;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+Step 7: Display the Containment Playbook Debrief in threattrail-frontend/src/pages/Report.jsxIn threattrail-frontend/src/pages/Report.jsx, right above <div className="rpt-results-section"> (line 95), render the graded Incident Containment Playbook Verdict if present:   JavaScript      {report.containment_eval && report.containment_eval.enabled && (
+        <div className="rpt-results-section">
+          <h3 className="rpt-section-title">🛡️ Incident Containment Playbook Evaluation</h3>
+          <div
+            className={`rpt-result-card ${
+              report.containment_eval.host_correct !== false && report.containment_eval.user_correct !== false
+                ? 'rpt-correct'
+                : 'rpt-incorrect'
+            }`}
+            style={{ padding: '16px 20px', flexDirection: 'column', gap: '8px' }}
+          >
+            <div><strong>Automated Quarantine Verdict:</strong> {report.containment_eval.feedback}</div>
+            <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap', fontSize: '0.85rem', color: 'var(--text-dim)' }}>
+              {report.containment_eval.expected_host && (
+                <span>
+                  Isolated Host: <strong style={{ color: 'var(--text)' }}>{report.containment_eval.selected_host || '(None)'}</strong>{' '}
+                  (Expected: <code>{report.containment_eval.expected_host}</code>)
+                </span>
+              )}
+              {report.containment_eval.expected_user && (
+                <span>
+                  Disabled Account: <strong style={{ color: 'var(--text)' }}>{report.containment_eval.selected_user || '(None)'}</strong>{' '}
+                  (Expected: <code>{report.containment_eval.expected_user}</code>)
+                </span>
               )}
             </div>
-Add the Editable Observed AD Environment (ad_context) Textarea inside Step 2 of Admin.jsx:   JavaScript              <div className="form-field" style={{ marginTop: 12 }}>
-                <label>Observed Active Directory & Telemetry Context JSON (Auto-extracted from logs — editable)</label>
-                <textarea
-                  className="admin-input"
-                  rows={6}
-                  style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}
-                  value={createAdContext}
-                  onChange={(e) => setCreateAdContext(e.target.value)}
-                />
-              </div>
-How to Test the New Auto-Analyzer Right AwaySave threattrail-backend/zip_analyzer.py and update threattrail-backend/main.py and threattrail-frontend/src/pages/Admin.jsx.In the browser, open Admin Panel → Create New Scenario.   Select any .zip file (either one of the 5 Mordor .zip archives or any other Windows Event .json/.jsonl .zip).   Watch the Telemetry Report appear immediately: it scans 100% of the archive, displays the confidence badge and caveats, populates the Observed vs. Inferred ad_context JSON, fills in the Sigma Rule YAML, and generates evidence-verified questions and answers defaulted to Draft status so you can review and publish with one click.   
+          </div>
+        </div>
+      )}

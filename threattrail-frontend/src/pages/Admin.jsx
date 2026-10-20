@@ -54,8 +54,10 @@ export default function Admin() {
   const [createAlertTitle, setCreateAlertTitle] = useState('')
   const [createAlertSeverity, setCreateAlertSeverity] = useState('High')
   const [createSigmaRule, setCreateSigmaRule] = useState('')
+  const [createContainmentHost, setCreateContainmentHost] = useState('')
+  const [createContainmentUser, setCreateContainmentUser] = useState('')
   const [createQuestions, setCreateQuestions] = useState([
-    { q: '', a: '', explanation: '', points: 10 }
+    { q: '', a: '', acceptable_answers: '', free_hint: '', hint: '', explanation: '', points: 10 }
   ])
   const [createFile, setCreateFile] = useState(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -72,6 +74,8 @@ export default function Admin() {
   const [editAlertTitle, setEditAlertTitle] = useState('')
   const [editAlertSeverity, setEditAlertSeverity] = useState('High')
   const [editSigmaRule, setEditSigmaRule] = useState('')
+  const [editContainmentHost, setEditContainmentHost] = useState('')
+  const [editContainmentUser, setEditContainmentUser] = useState('')
   const [createAdContext, setCreateAdContext] = useState('{}')
   const [isAnalyzingZip, setIsAnalyzingZip] = useState(false)
   const [zipAnalysisReport, setZipAnalysisReport] = useState(null)
@@ -285,7 +289,10 @@ export default function Admin() {
   }
 
   const handleAddCreateQuestion = () => {
-    setCreateQuestions([...createQuestions, { q: '', a: '', explanation: '', points: 10 }])
+    setCreateQuestions([
+      ...createQuestions,
+      { q: '', a: '', acceptable_answers: '', free_hint: '', hint: '', explanation: '', points: 10 }
+    ])
   }
 
   const handleCreateQuestionChange = (i, field, val) => {
@@ -325,14 +332,21 @@ export default function Admin() {
       setCreateAlertTitle(draft.alert_title || '')
       setCreateAlertSeverity(draft.alert_severity || 'High')
       setCreateSigmaRule(draft.sigma_rule || '')
-      setCreateAdContext(JSON.stringify(draft.ad_context || {}, null, 2))
+
+      const adCtx = draft.ad_context || {}
+      const targets = adCtx.containment_targets || {}
+      setCreateContainmentHost(targets.isolate_host || '')
+      setCreateContainmentUser(targets.disable_user || '')
+      setCreateAdContext(JSON.stringify(adCtx, null, 2))
 
       if (draft.questions && draft.questions.length > 0) {
         setCreateQuestions(
           draft.questions.map((q) => ({
-            q: q.question_text,
-            a: q.correct_answer,
-            acceptable_answers: q.acceptable_answers || [],
+            q: q.question_text || '',
+            a: q.correct_answer || '',
+            acceptable_answers: Array.isArray(q.acceptable_answers) ? q.acceptable_answers.join(', ') : '',
+            free_hint: q.free_hint || '',
+            hint: q.hint || '',
             explanation: q.explanation || '',
             points: q.points || 10,
           }))
@@ -365,12 +379,23 @@ export default function Admin() {
         throw new Error('Observed AD Environment JSON is not valid JSON.')
       }
 
+      if (createContainmentHost.trim() || createContainmentUser.trim()) {
+        parsedAdContext.containment_targets = {
+          isolate_host: createContainmentHost.trim(),
+          disable_user: createContainmentUser.trim(),
+        }
+      }
+
       const validQuestions = createQuestions
         .filter((q) => q.q.trim() && q.a.trim())
         .map((q) => ({
           question_text: q.q.trim(),
           correct_answer: q.a.trim(),
-          acceptable_answers: q.acceptable_answers || [],
+          acceptable_answers: typeof q.acceptable_answers === 'string'
+            ? q.acceptable_answers.split(',').map((s) => s.trim()).filter(Boolean)
+            : (q.acceptable_answers || []),
+          free_hint: q.free_hint?.trim() || null,
+          hint: q.hint?.trim() || null,
           explanation: q.explanation?.trim() || null,
           points: parseInt(q.points) || 10,
         }))
@@ -420,9 +445,11 @@ export default function Admin() {
       setCreateAlertTitle('')
       setCreateAlertSeverity('High')
       setCreateSigmaRule('')
+      setCreateContainmentHost('')
+      setCreateContainmentUser('')
       setCreateAdContext('{}')
       setZipAnalysisReport(null)
-      setCreateQuestions([{ q: '', a: '', explanation: '', points: 10 }])
+      setCreateQuestions([{ q: '', a: '', acceptable_answers: '', free_hint: '', hint: '', explanation: '', points: 10 }])
       setCreateFile(null)
 
       loadAdminData()
@@ -450,17 +477,25 @@ export default function Admin() {
       setEditAlertTitle(detail.alert ? detail.alert.title : '')
       setEditAlertSeverity(detail.alert ? detail.alert.severity : 'High')
       setEditSigmaRule(detail.alert?.sigma_rule || '')
-      setEditAdContext(JSON.stringify(detail.ad_context || {}, null, 2))
+
+      const adCtx = detail.ad_context || {}
+      const targets = adCtx.containment_targets || {}
+      setEditContainmentHost(targets.isolate_host || '')
+      setEditContainmentUser(targets.disable_user || '')
+      setEditAdContext(JSON.stringify(adCtx, null, 2))
+
       setEditQuestions(
         detail.questions && detail.questions.length > 0
           ? detail.questions.map((q) => ({
-              question_text: q.question_text,
-              correct_answer: q.correct_answer,
-              acceptable_answers: q.acceptable_answers || [],
+              question_text: q.question_text || '',
+              correct_answer: q.correct_answer || '',
+              acceptable_answers: Array.isArray(q.acceptable_answers) ? q.acceptable_answers.join(', ') : (q.acceptable_answers || ''),
+              free_hint: q.free_hint || '',
+              hint: q.hint || '',
               explanation: q.explanation || '',
               points: q.points ?? 10,
             }))
-          : [{ question_text: '', correct_answer: '', acceptable_answers: [], explanation: '', points: 10 }]
+          : [{ question_text: '', correct_answer: '', acceptable_answers: '', free_hint: '', hint: '', explanation: '', points: 10 }]
       )
     } catch (err) {
       showToast(`Failed to load scenario details: ${err.message}`, 'error')
@@ -481,6 +516,13 @@ export default function Admin() {
         throw new Error('Observed AD Environment JSON is not valid JSON.')
       }
 
+      if (editContainmentHost.trim() || editContainmentUser.trim()) {
+        parsedEditAdContext.containment_targets = {
+          isolate_host: editContainmentHost.trim(),
+          disable_user: editContainmentUser.trim(),
+        }
+      }
+
       const payload = {
         name: editName,
         description: editDesc,
@@ -493,9 +535,13 @@ export default function Admin() {
         questions: editQuestions
           .filter((q) => q.question_text.trim() && q.correct_answer.trim())
           .map((q) => ({
-            question_text: q.question_text,
-            correct_answer: q.correct_answer,
-            acceptable_answers: q.acceptable_answers || [],
+            question_text: q.question_text.trim(),
+            correct_answer: q.correct_answer.trim(),
+            acceptable_answers: typeof q.acceptable_answers === 'string'
+              ? q.acceptable_answers.split(',').map((s) => s.trim()).filter(Boolean)
+              : (q.acceptable_answers || []),
+            free_hint: q.free_hint?.trim() || null,
+            hint: q.hint?.trim() || null,
             explanation: q.explanation?.trim() || null,
             points: parseInt(q.points) || 10,
           })),
@@ -965,15 +1011,45 @@ export default function Admin() {
                   onChange={(e) => setCreateAdContext(e.target.value)}
                 />
               </div>
+
+              {/* Containment Targets Control */}
+              <div className="form-row" style={{ marginTop: 12, padding: 12, background: 'rgba(245, 158, 11, 0.06)', border: '1px solid rgba(245, 158, 11, 0.25)', borderRadius: 8 }}>
+                <div style={{ width: '100%', marginBottom: 4 }}>
+                  <strong style={{ color: '#fbbf24', fontSize: '0.86rem' }}>
+                    🛡️ Incident Containment Playbook Targets (Controls Analyst Containment Box)
+                  </strong>
+                  <p style={{ fontSize: '0.78rem', color: 'var(--text-dim)', margin: 0 }}>
+                    Specify which compromised host and user account the analyst should quarantine at the end of the investigation (auto-filled when analyzing a .zip, or leave blank to disable containment grading).
+                  </p>
+                </div>
+                <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                  <label>Expected Host to Isolate (e.g. MORDORDC.theshire.local)</label>
+                  <input
+                    className="admin-input"
+                    value={createContainmentHost}
+                    onChange={(e) => setCreateContainmentHost(e.target.value)}
+                    placeholder="Optional: Hostname to isolate"
+                  />
+                </div>
+                <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                  <label>Expected Compromised Account to Disable (e.g. pgustavo)</label>
+                  <input
+                    className="admin-input"
+                    value={createContainmentUser}
+                    onChange={(e) => setCreateContainmentUser(e.target.value)}
+                    placeholder="Optional: Username to disable"
+                  />
+                </div>
+              </div>
             </div>
 
             <div className="form-section-card">
               <div className="section-title">
                 <span className="step-num">3</span>
-                <h4>Investigation Questions & Debrief Explanations</h4>
+                <h4>Investigation Questions, Hints & Acceptable Aliases</h4>
               </div>
               {createQuestions.map((q, idx) => (
-                <div key={idx} style={{ marginBottom: 14, paddingBottom: 12, borderBottom: '1px solid var(--border)' }}>
+                <div key={idx} style={{ marginBottom: 16, padding: 14, background: 'rgba(255,255,255,0.02)', borderRadius: 8, border: '1px solid var(--border)' }}>
                   <div className="question-input-row">
                     <span className="q-index-pill">Q{idx + 1}</span>
                     <input
@@ -985,7 +1061,7 @@ export default function Admin() {
                     />
                     <input
                       className="admin-input flex-1"
-                      placeholder="Expected Answer..."
+                      placeholder="Canonical Answer..."
                       value={q.a}
                       onChange={(e) => handleCreateQuestionChange(idx, 'a', e.target.value)}
                       required
@@ -994,6 +1070,7 @@ export default function Admin() {
                       type="number"
                       className="admin-input"
                       style={{ width: 80 }}
+                      title="Question Points"
                       value={q.points}
                       onChange={(e) => handleCreateQuestionChange(idx, 'points', e.target.value)}
                     />
@@ -1005,13 +1082,48 @@ export default function Admin() {
                       ×
                     </button>
                   </div>
-                  <input
-                    className="admin-input"
-                    style={{ width: '100%', marginTop: 6 }}
-                    placeholder="Debrief Explanation (shown after grading to explain how to find the IOC)..."
-                    value={q.explanation}
-                    onChange={(e) => handleCreateQuestionChange(idx, 'explanation', e.target.value)}
-                  />
+
+                  <div className="form-row" style={{ marginTop: 8, marginBottom: 8 }}>
+                    <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: '0.76rem', color: '#94a3b8' }}>Acceptable Answer Aliases (comma-separated)</label>
+                      <input
+                        className="admin-input"
+                        placeholder="e.g., corp\svc_backup, svc_backup@corp.local"
+                        value={q.acceptable_answers || ''}
+                        onChange={(e) => handleCreateQuestionChange(idx, 'acceptable_answers', e.target.value)}
+                      />
+                    </div>
+                    <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: '0.76rem', color: '#34d399' }}>🎁 Free Starter Hint (0 pts penalty)</label>
+                      <input
+                        className="admin-input"
+                        placeholder="Starter pointer shown when trainee clicks Free Hint..."
+                        value={q.free_hint || ''}
+                        onChange={(e) => handleCreateQuestionChange(idx, 'free_hint', e.target.value)}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="form-row" style={{ marginBottom: 0 }}>
+                    <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: '0.76rem', color: '#fbbf24' }}>💡 Paid Forensic Hint (-15 pts penalty, unlocks after 2 wrong tries)</label>
+                      <input
+                        className="admin-input"
+                        placeholder="Detailed forensic walkthrough hint..."
+                        value={q.hint || ''}
+                        onChange={(e) => handleCreateQuestionChange(idx, 'hint', e.target.value)}
+                      />
+                    </div>
+                    <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                      <label style={{ fontSize: '0.76rem', color: '#60a5fa' }}>📋 Post-Submission Debrief Explanation</label>
+                      <input
+                        className="admin-input"
+                        placeholder="Shown on Report page after grading..."
+                        value={q.explanation || ''}
+                        onChange={(e) => handleCreateQuestionChange(idx, 'explanation', e.target.value)}
+                      />
+                    </div>
+                  </div>
                 </div>
               ))}
               <button type="button" className="btn btn-secondary btn-sm" onClick={handleAddCreateQuestion}>
@@ -1527,14 +1639,44 @@ export default function Admin() {
                   />
                 </div>
 
+                {/* Edit Containment Targets Control */}
+                <div className="form-row" style={{ marginTop: 12, padding: 12, background: 'rgba(245, 158, 11, 0.06)', border: '1px solid rgba(245, 158, 11, 0.25)', borderRadius: 8 }}>
+                  <div style={{ width: '100%', marginBottom: 4 }}>
+                    <strong style={{ color: '#fbbf24', fontSize: '0.86rem' }}>
+                      🛡️ Incident Containment Playbook Targets (Controls Analyst Containment Box)
+                    </strong>
+                    <p style={{ fontSize: '0.78rem', color: 'var(--text-dim)', margin: 0 }}>
+                      Specify which compromised host and user account the analyst should quarantine at the end of the investigation (or leave blank to disable containment grading).
+                    </p>
+                  </div>
+                  <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                    <label>Expected Host to Isolate (e.g. MORDORDC.theshire.local)</label>
+                    <input
+                      className="admin-input"
+                      value={editContainmentHost}
+                      onChange={(e) => setEditContainmentHost(e.target.value)}
+                      placeholder="Optional: Hostname to isolate"
+                    />
+                  </div>
+                  <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                    <label>Expected Compromised Account to Disable (e.g. pgustavo)</label>
+                    <input
+                      className="admin-input"
+                      value={editContainmentUser}
+                      onChange={(e) => setEditContainmentUser(e.target.value)}
+                      placeholder="Optional: Username to disable"
+                    />
+                  </div>
+                </div>
+
                 {/* ── Edit Questions ─────────────────────────────── */}
                 <div className="form-section-card" style={{ marginTop: 16 }}>
                   <div className="section-title">
                     <span className="step-num">Q</span>
-                    <h4>Investigation Questions</h4>
+                    <h4>Investigation Questions, Hints & Acceptable Aliases</h4>
                   </div>
                   {editQuestions.map((q, i) => (
-                    <div key={i} className="question-block" style={{ marginBottom: 14, padding: '12px', background: 'rgba(255,255,255,0.04)', borderRadius: 8, border: '1px solid rgba(255,255,255,0.08)' }}>
+                    <div key={i} className="question-block" style={{ marginBottom: 14, padding: '14px', background: 'rgba(255,255,255,0.04)', borderRadius: 8, border: '1px solid rgba(255,255,255,0.08)' }}>
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
                         <span style={{ fontSize: '0.78rem', color: '#94a3b8', fontWeight: 600 }}>Question {i + 1}</span>
                         <button
@@ -1563,7 +1705,7 @@ export default function Admin() {
                       </div>
                       <div className="form-row">
                         <div className="form-field flex-2" style={{ marginBottom: 0 }}>
-                          <label style={{ fontSize: '0.78rem' }}>Correct Answer</label>
+                          <label style={{ fontSize: '0.78rem' }}>Canonical Answer</label>
                           <input
                             className="admin-input"
                             value={q.correct_answer}
@@ -1592,18 +1734,63 @@ export default function Admin() {
                           />
                         </div>
                       </div>
-                      <div className="form-field" style={{ marginTop: 8, marginBottom: 0 }}>
-                        <label style={{ fontSize: '0.78rem' }}>Explanation (shown after submission)</label>
-                        <input
-                          className="admin-input"
-                          value={q.explanation || ''}
-                          onChange={e => {
-                            const updated = [...editQuestions]
-                            updated[i] = { ...updated[i], explanation: e.target.value }
-                            setEditQuestions(updated)
-                          }}
-                          placeholder="Why is this the correct answer?"
-                        />
+
+                      <div className="form-row" style={{ marginTop: 8, marginBottom: 8 }}>
+                        <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                          <label style={{ fontSize: '0.76rem', color: '#94a3b8' }}>Acceptable Answer Aliases (comma-separated)</label>
+                          <input
+                            className="admin-input"
+                            placeholder="e.g., corp\svc_backup, svc_backup@corp.local"
+                            value={q.acceptable_answers || ''}
+                            onChange={e => {
+                              const updated = [...editQuestions]
+                              updated[i] = { ...updated[i], acceptable_answers: e.target.value }
+                              setEditQuestions(updated)
+                            }}
+                          />
+                        </div>
+                        <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                          <label style={{ fontSize: '0.76rem', color: '#34d399' }}>🎁 Free Starter Hint (0 pts penalty)</label>
+                          <input
+                            className="admin-input"
+                            placeholder="Starter pointer shown when trainee clicks Free Hint..."
+                            value={q.free_hint || ''}
+                            onChange={e => {
+                              const updated = [...editQuestions]
+                              updated[i] = { ...updated[i], free_hint: e.target.value }
+                              setEditQuestions(updated)
+                            }}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="form-row" style={{ marginBottom: 0 }}>
+                        <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                          <label style={{ fontSize: '0.76rem', color: '#fbbf24' }}>💡 Paid Forensic Hint (-15 pts penalty, unlocks after 2 wrong tries)</label>
+                          <input
+                            className="admin-input"
+                            placeholder="Detailed forensic walkthrough hint..."
+                            value={q.hint || ''}
+                            onChange={e => {
+                              const updated = [...editQuestions]
+                              updated[i] = { ...updated[i], hint: e.target.value }
+                              setEditQuestions(updated)
+                            }}
+                          />
+                        </div>
+                        <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                          <label style={{ fontSize: '0.76rem', color: '#60a5fa' }}>📋 Post-Submission Debrief Explanation</label>
+                          <input
+                            className="admin-input"
+                            placeholder="Shown on Report page after grading..."
+                            value={q.explanation || ''}
+                            onChange={e => {
+                              const updated = [...editQuestions]
+                              updated[i] = { ...updated[i], explanation: e.target.value }
+                              setEditQuestions(updated)
+                            }}
+                          />
+                        </div>
                       </div>
                     </div>
                   ))}
@@ -1611,7 +1798,7 @@ export default function Admin() {
                     type="button"
                     className="btn btn-secondary"
                     style={{ marginTop: 4, fontSize: '0.82rem', padding: '6px 14px' }}
-                    onClick={() => setEditQuestions([...editQuestions, { question_text: '', correct_answer: '', explanation: '', points: 10 }])}
+                    onClick={() => setEditQuestions([...editQuestions, { question_text: '', correct_answer: '', acceptable_answers: '', free_hint: '', hint: '', explanation: '', points: 10 }])}
                   >
                     + Add Question
                   </button>

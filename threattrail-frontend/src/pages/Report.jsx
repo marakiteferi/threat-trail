@@ -279,6 +279,36 @@ export default function Report() {
         </div>
       </div>
 
+      {report.containment_eval && report.containment_eval.enabled && (
+        <div className="rpt-results-section">
+          <h3 className="rpt-section-title">🛡️ Incident Containment Playbook Evaluation</h3>
+          <div
+            className={`rpt-result-card ${
+              report.containment_eval.host_correct !== false && report.containment_eval.user_correct !== false
+                ? 'rpt-correct'
+                : 'rpt-incorrect'
+            }`}
+            style={{ padding: '16px 20px', flexDirection: 'column', gap: '8px' }}
+          >
+            <div><strong>Automated Quarantine Verdict:</strong> {report.containment_eval.feedback}</div>
+            <div style={{ display: 'flex', gap: '24px', flexWrap: 'wrap', fontSize: '0.85rem', color: 'var(--text-dim)' }}>
+              {report.containment_eval.expected_host && (
+                <span>
+                  Isolated Host: <strong style={{ color: 'var(--text)' }}>{report.containment_eval.selected_host || '(None)'}</strong>{' '}
+                  (Expected: <code>{report.containment_eval.expected_host}</code>)
+                </span>
+              )}
+              {report.containment_eval.expected_user && (
+                <span>
+                  Disabled Account: <strong style={{ color: 'var(--text)' }}>{report.containment_eval.selected_user || '(None)'}</strong>{' '}
+                  (Expected: <code>{report.containment_eval.expected_user}</code>)
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="rpt-results-section">
         <h3 className="rpt-section-title">Question-by-Question Debrief</h3>
         <div className="rpt-results-list">

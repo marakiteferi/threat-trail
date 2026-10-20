@@ -990,6 +990,35 @@ def analyze_zip_archive(content: bytes, target_sample_count: int = 350) -> dict[
 
     detection = evaluate_detection_rules(events)
     ad_context = extract_observed_ad_context(events)
+
+    key_evs = [events[i] for i in sorted(detection["key_indices"])] if detection["key_indices"] else events[:5]
+    inferred_host = next((e["target_host"] for e in key_evs if e.get("target_host")), "")
+    inferred_user = next(
+        (
+            (e["target_user"] or e["subject_user"] or e["username"]).split("\\")[-1].split("@")[0]
+            for e in key_evs
+            if (e.get("target_user") or e.get("subject_user") or e.get("username"))
+            and not str(e.get("target_user") or e.get("subject_user") or e.get("username")).endswith("$")
+            and str(e.get("target_user") or e.get("subject_user") or e.get("username")).upper() not in ("SYSTEM", "ANONYMOUS LOGON")
+        ),
+        "",
+    )
+    ad_context["containment_targets"] = {
+        "isolate_host": inferred_host,
+        "disable_user": inferred_user,
+    }
+
+    # Ensure every auto-generated question has both a Free Starter Hint and a Paid Forensic Hint
+    for q in detection["questions"]:
+        q.setdefault(
+            "free_hint",
+            "Filter by the Event ID in the Sigma Rule and expand the suspicious event in the Log Inspector.",
+        )
+        q.setdefault(
+            "hint",
+            q.get("explanation") or f"Inspect the key evidence event fields for '{q['correct_answer']}'.",
+        )
+
     curated = smart_curate_events(events, detection["key_indices"], target_sample_count)
 
     return {

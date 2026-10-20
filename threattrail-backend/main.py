@@ -22,7 +22,7 @@ from schemas import (
     ScenarioAdminOut, ScenarioAdminDetailOut, ScenarioFullCreate, ScenarioFullUpdate,
     UserRegister, UserLogin, UserOut, AuthResponse, UserProfileUpdate, UserProfileOut,
     UserAdminOut, UserAdminCreate, UserAdminUpdateRole, UserAdminResetPassword,
-    VerifyFindingRequest, VerifyFindingResponse, HintResponse,
+    VerifyFindingRequest, VerifyFindingResponse, HintResponse, ContainmentResult,
     SubmissionAdminOut, LeaderboardUserOut,
 )
 from zip_analyzer import analyze_zip_archive, extract_field_from_message
@@ -150,6 +150,8 @@ def on_startup():
 
                 res_q = conn.execute(text("PRAGMA table_info(questions);")).fetchall()
                 q_cols = [r[1] for r in res_q]
+                if "free_hint" not in q_cols:
+                    conn.execute(text("ALTER TABLE questions ADD COLUMN free_hint TEXT;"))
                 if "hint" not in q_cols:
                     conn.execute(text("ALTER TABLE questions ADD COLUMN hint TEXT;"))
 
@@ -172,6 +174,7 @@ def on_startup():
                 conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;"))
                 conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email VARCHAR(200);"))
                 conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_color VARCHAR(20) DEFAULT '#3b82f6';"))
+                conn.execute(text("ALTER TABLE questions ADD COLUMN IF NOT EXISTS free_hint TEXT;"))
                 conn.execute(text("ALTER TABLE questions ADD COLUMN IF NOT EXISTS hint TEXT;"))
                 conn.execute(text("ALTER TABLE investigation_results ADD COLUMN IF NOT EXISTS hints_used JSONB;"))
                 conn.execute(text("ALTER TABLE investigation_results ADD COLUMN IF NOT EXISTS free_hint_id INTEGER;"))
@@ -543,6 +546,35 @@ def diagnose_analyst_mistake(user_raw: str, question: Question, scenario: Scenar
     return None
 
 
+def generate_fallback_free_hint(question: Question) -> str:
+    """Generates a gentle starter pointer if the admin left free_hint blank."""
+    if question.free_hint and question.free_hint.strip():
+        return question.free_hint.strip()
+    q_low = (question.question_text or "").lower()
+    if "event id" in q_low:
+        return "Starter Clue: Click 'View Sigma Rule' in the top alert banner or check the 'Event Cheat Sheet' tab to match the activity to its Windows Event ID."
+    if "source ip" in q_low or "client" in q_low or "ip address" in q_low:
+        return "Starter Clue: Check the 'Suspect IPs' quick-filter bar or expand the relevant authentication/network event in the Log Inspector to check the Source IP field."
+    if "account" in q_low or "user" in q_low or "subjectusername" in q_low:
+        return "Starter Clue: Expand the matching event row to open the Forensic Triage View, then inspect 'Identity & Session Context' (ignore machine accounts ending in '$')."
+    if "host" in q_low or "workstation" in q_low or "computer" in q_low:
+        return "Starter Clue: Look at the 'Target Host' column on the suspicious event row or check the 'AD Environment' tab."
+    if "mitre" in q_low:
+        return "Starter Clue: Check the top SIEM Alert Banner or the tags section at the bottom of the Sigma Detection Rule."
+    return "Starter Clue: Filter the logs using the Event IDs mentioned in the Sigma Rule, then expand the suspicious event to inspect its decoded fields."
+
+
+def generate_fallback_paid_hint(question: Question) -> str:
+    """Generates a detailed forensic walkthrough if the admin left paid hint blank."""
+    if question.hint and question.hint.strip():
+        return question.hint.strip()
+    if question.explanation and question.explanation.strip():
+        return f"Forensic Walkthrough: {question.explanation.strip()}"
+    ans = (question.correct_answer or "").strip()
+    masked = ans[:2] + "***" + (ans[-1] if len(ans) > 3 else "")
+    return f"Forensic Walkthrough: Search the logs for indicators matching pattern '{masked}' (length: {len(ans)} chars)."
+
+
 @app.post("/api/scenarios/{scenario_id}/verify-finding", response_model=VerifyFindingResponse)
 def verify_finding(
     scenario_id: int,
@@ -551,57 +583,67 @@ def verify_finding(
     current_user: Optional[User] = Depends(get_optional_user),
 ):
     scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
-    _check_scenario_access(scenario, current_user)
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
 
-    question = db.query(Question).filter(Question.id == body.question_id, Question.scenario_id == scenario_id).first()
+    question = (
+        db.query(Question)
+        .filter(Question.id == body.question_id, Question.scenario_id == scenario_id)
+        .first()
+    )
     if not question:
-        raise HTTPException(status_code=404, detail="Question not found")
+        raise HTTPException(status_code=404, detail="Question not found in this scenario")
 
-    trap_msg = None
+    is_correct = is_answer_match(body.answer, question.correct_answer, question.acceptable_answers)
     if is_correct:
-        msg = "Correct finding! Excellent analysis."
-    else:
-        trap_msg = diagnose_analyst_mistake(body.answer, question, scenario)
-        msg = trap_msg if trap_msg else "Incorrect finding. Inspect the logs more closely."
+        return VerifyFindingResponse(
+            question_id=question.id,
+            is_correct=True,
+            trap_detected=False,
+            message="Verified! Your finding matches the forensic evidence in the logs.",
+        )
+
+    trap_msg = diagnose_analyst_mistake(body.answer, question, scenario)
+    if trap_msg:
+        return VerifyFindingResponse(
+            question_id=question.id,
+            is_correct=False,
+            trap_detected=True,
+            message=trap_msg,
+            trap_msg=trap_msg,
+        )
 
     return VerifyFindingResponse(
         question_id=question.id,
-        is_correct=is_correct,
-        message=msg,
-        trap_msg=trap_msg
+        is_correct=False,
+        trap_detected=False,
+        message=f"'{body.answer.strip()}' does not match the expected indicator. Re-check the Log Inspector fields or use a Free Hint.",
     )
 
 
-@app.post("/api/scenarios/{scenario_id}/questions/{question_id}/hint", response_model=HintResponse)
+@app.post("/api/scenarios/{scenario_id}/questions/{question_id}/hint")
 def get_question_hint(
     scenario_id: int,
     question_id: int,
-    is_free: bool = Query(False, description="Whether this hint is claimed using the free hint button"),
+    is_free: bool = Query(False),
     db: Session = Depends(get_db),
     current_user: Optional[User] = Depends(get_optional_user),
 ):
-    scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
-    _check_scenario_access(scenario, current_user)
-
-    question = db.query(Question).filter(Question.id == question_id, Question.scenario_id == scenario_id).first()
+    question = (
+        db.query(Question)
+        .filter(Question.id == question_id, Question.scenario_id == scenario_id)
+        .first()
+    )
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
 
-    if is_free:
-        hint_text = question.hint or (
-            "Focus on the Event IDs related to this incident. Look at the suspicious IPs and verify timestamp order."
-        )
-    else:
-        hint_text = question.explanation or question.hint or (
-            "Cross-reference the relevant security event IDs with timestamps to identify the forensic artifact."
-        )
-
-    return HintResponse(
-        question_id=question.id,
-        hint=hint_text,
-        point_deduction=0 if is_free else 15,
-        is_free=is_free,
-    )
+    hint_text = generate_fallback_free_hint(question) if is_free else generate_fallback_paid_hint(question)
+    return {
+        "question_id": question.id,
+        "is_free": is_free,
+        "penalty": 0 if is_free else 15,
+        "hint": hint_text,
+    }
 
 
 @app.post("/api/scenarios/{scenario_id}/submit", response_model=SubmissionResponse)
@@ -656,14 +698,56 @@ def submit_answers(
     if body.free_hint_id and body.free_hint_id not in free_hints_used:
         free_hints_used.append(body.free_hint_id)
 
-    # Paid forensic hints unlocked via the 2-trial button deduct 15 points each:
-    hint_penalty = len(hints_used) * 15
+    # Apply paid hint penalty (-15 pts per unique paid hint used)
+    unique_paid_hints = set(body.hints_used or [])
+    hint_penalty = len(unique_paid_hints) * 15
     adjusted_points_earned = max(0, points_earned - hint_penalty)
 
     total = len(questions)
-    score_percent = round((adjusted_points_earned / total_points) * 100) if total_points > 0 else (
-        round((correct_count / total) * 100) if total > 0 else 0
-    )
+    score_percent = round((adjusted_points_earned / total_points) * 100) if total_points > 0 else 0
+
+    # Evaluate Incident Containment Playbook if configured on the scenario
+    ad_ctx = scenario.ad_context or {}
+    containment_cfg = ad_ctx.get("containment_targets") or {}
+    expected_host = (containment_cfg.get("isolate_host") or "").strip()
+    expected_user = (containment_cfg.get("disable_user") or "").strip()
+
+    containment_eval = None
+    if expected_host or expected_user:
+        sel_host = (body.containment_host or "").strip()
+        sel_user = (body.containment_user or "").strip()
+
+        host_ok = is_answer_match(sel_host, expected_host, [expected_host.split(".")[0]]) if expected_host else True
+        user_ok = is_answer_match(sel_user, expected_user) if expected_user else True
+
+        feedback_parts = []
+        if expected_host:
+            if host_ok:
+                feedback_parts.append(f"✅ Host Isolation Correct: Isolated '{sel_host}'.")
+            elif not sel_host:
+                feedback_parts.append(f"⚠️ Missed Host Isolation: Expected '{expected_host}' to be isolated.")
+            else:
+                feedback_parts.append(f"❌ False-Positive Host Isolation: You isolated '{sel_host}' instead of '{expected_host}'.")
+        if expected_user:
+            if user_ok:
+                feedback_parts.append(f"✅ Account Containment Correct: Disabled '{sel_user}'.")
+            elif not sel_user:
+                feedback_parts.append(f"⚠️ Missed Account Containment: Expected '{expected_user}' to be disabled.")
+            elif sel_user.upper() in ("SYSTEM", "LOCAL SYSTEM") or sel_user.endswith("$"):
+                feedback_parts.append(f"❌ Critical SOC Mistake: Disabling '{sel_user}' (a built-in OS or machine '$' account) causes severe production outage! Target the compromised user '{expected_user}'.")
+            else:
+                feedback_parts.append(f"❌ Wrong Account Disabled: You disabled '{sel_user}' instead of '{expected_user}'.")
+
+        containment_eval = ContainmentResult(
+            enabled=True,
+            expected_host=expected_host or None,
+            selected_host=sel_host or None,
+            host_correct=host_ok if expected_host else None,
+            expected_user=expected_user or None,
+            selected_user=sel_user or None,
+            user_correct=user_ok if expected_user else None,
+            feedback=" ".join(feedback_parts),
+        )
 
     resolved_user_id = current_user.id
 
@@ -705,6 +789,7 @@ def submit_answers(
         free_hints_used=free_hints_used,
         hint_penalty=hint_penalty,
         trials_count=body.trials_count or 1,
+        containment_eval=containment_eval,
         results=results,
     )
 
@@ -1071,6 +1156,8 @@ def create_scenario_full(body: ScenarioFullCreate, db: Session = Depends(get_db)
                     question_text=q.question_text.strip(),
                     correct_answer=q.correct_answer.strip(),
                     acceptable_answers=q.acceptable_answers or [],
+                    free_hint=q.free_hint,
+                    hint=q.hint,
                     explanation=q.explanation,
                     points=q.points or 10,
                 ))
@@ -1153,6 +1240,8 @@ def full_update_scenario(scenario_id: int, body: ScenarioFullUpdate, db: Session
                     question_text=q.question_text,
                     correct_answer=q.correct_answer,
                     acceptable_answers=q.acceptable_answers or [],
+                    free_hint=q.free_hint,
+                    hint=q.hint,
                     explanation=q.explanation,
                     points=q.points if q.points is not None else 10,
                 )

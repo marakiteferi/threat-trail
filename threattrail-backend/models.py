@@ -89,8 +89,9 @@ class Question(Base):
     question_text = Column(Text, nullable=False)
     correct_answer = Column(String(300), nullable=False)
     acceptable_answers = Column(JSONType, nullable=True, default=list)
-    explanation = Column(Text, nullable=True)
+    free_hint = Column(Text, nullable=True)
     hint = Column(Text, nullable=True)
+    explanation = Column(Text, nullable=True)
     points = Column(Integer, default=10, nullable=False)
 
     scenario = relationship("Scenario", back_populates="questions")
