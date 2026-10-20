@@ -4,6 +4,7 @@ import api from '../api'
 import LogInspector from '../components/LogInspector'
 import {
   ShieldAlert,
+  Shield,
   Search,
   Pin,
   Code2,
@@ -24,6 +25,9 @@ import {
   AlertTriangle,
   Lock,
   Lightbulb,
+  Activity,
+  Terminal,
+  Database,
 } from 'lucide-react'
 
 const EVENT_CHEAT_SHEET = [
@@ -41,18 +45,23 @@ const EVENT_CHEAT_SHEET = [
 /** Detect likely external / attacker IPs: any IP that doesn't match common internal RFC-1918 ranges */
 function classifyIPs(logs) {
   const internal = /^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.)/
+  // Placeholder strings that Windows logs emit in lieu of a real IP
+  const PLACEHOLDERS = new Set(['-', '', '::1', '127.0.0.1', '0.0.0.0', '::'])
   const byIp = {}
   for (const log of logs) {
     const ip = log.source_ip
-    if (!ip || internal.test(ip)) continue
+    if (!ip || PLACEHOLDERS.has(ip.trim())) continue   // skip placeholders
+    if (ip.toLowerCase().startsWith('fe80')) continue   // skip IPv6 link-local
+    if (internal.test(ip)) continue                     // skip RFC-1918
     byIp[ip] = (byIp[ip] || 0) + 1
   }
   // Also detect IPs that appear in bursts of failures (even if internal)
   const failures = {}
   for (const log of logs) {
-    if (!log.source_ip) continue
+    const ip = log.source_ip
+    if (!ip || PLACEHOLDERS.has(ip.trim())) continue
     if (log.event_id === 4625 || log.event_id === 4771) {
-      failures[log.source_ip] = (failures[log.source_ip] || 0) + 1
+      failures[ip] = (failures[ip] || 0) + 1
     }
   }
   for (const [ip, cnt] of Object.entries(failures)) {
@@ -82,6 +91,30 @@ export default function Investigation() {
   const [keyEvidenceOnly, setKeyEvidenceOnly] = useState(false)
   // Time-range filter: indices into sorted log array
   const [timeRangeIdx, setTimeRangeIdx] = useState([0, 100]) // [startPct, endPct] as percentage 0–100
+
+  const [guidedMode, setGuidedMode] = useState(false)
+  const [showAnomalyHunter, setShowAnomalyHunter] = useState(false)
+  const [pivotNotice, setPivotNotice] = useState(null)
+  const [containmentHost, setContainmentHost] = useState('')
+  const [containmentUser, setContainmentUser] = useState('')
+
+  const handlePivotFromInspector = useCallback((value, label) => {
+    setSearchTerm(value)
+    setActiveLeftTab('logs')
+    setPivotNotice(`Pivoted on ${label}: "${value}"`)
+    setTimeout(() => setPivotNotice(null), 4000)
+  }, [])
+
+  const handlePivotToSigmaEvents = useCallback(() => {
+    if (!alert?.sigma_rule) return
+    const matches = [...alert.sigma_rule.matchAll(/EventID:\s*(\d+)/gi)].map(m => m[1])
+    if (matches.length > 0) {
+      setSelectedEventIds(matches)
+      setActiveLeftTab('logs')
+      setPivotNotice(`Applied Sigma Detection Filter: Event ID(s) ${matches.join(', ')}`)
+      setTimeout(() => setPivotNotice(null), 4000)
+    }
+  }, [alert])
 
   const [activeLeftTab, setActiveLeftTab] = useState('logs')
   const [showSigmaModal, setShowSigmaModal] = useState(false)
@@ -216,6 +249,69 @@ export default function Investigation() {
     })
   }, [logs, selectedEventIds, selectedAttackerIp, keyEvidenceOnly, filterStartTs, filterEndTs, searchTerm])
 
+  const histogramBuckets = useMemo(() => {
+    if (logs.length < 2 || minTs === maxTs) return []
+    const bucketCount = 24
+    const span = (maxTs - minTs) / bucketCount
+    const buckets = Array.from({ length: bucketCount }, (_, i) => ({
+      index: i,
+      startPct: Math.round((i / bucketCount) * 100),
+      endPct: Math.round(((i + 1) / bucketCount) * 100),
+      startTime: new Date(minTs + i * span).toLocaleTimeString(),
+      count: 0,
+      alertCount: 0,
+    }))
+    for (const l of logs) {
+      const t = new Date(l.timestamp).getTime()
+      const idx = Math.min(bucketCount - 1, Math.max(0, Math.floor((t - minTs) / span)))
+      buckets[idx].count += 1
+      if ([4625, 4662, 7045, 4697, 10, 4104].includes(l.event_id)) {
+        buckets[idx].alertCount += 1
+      }
+    }
+    return buckets
+  }, [logs, minTs, maxTs])
+
+  const fieldAnomalies = useMemo(() => {
+    const procCounts = {}
+    const userCounts = {}
+    const svcCounts = {}
+
+    for (const l of filteredLogs) {
+      const raw = l.raw_event_data || {}
+      const proc = raw.Image || raw.NewProcessName || raw.SourceImage || raw.ProcessName
+      if (proc && proc !== '-') {
+        const shortProc = String(proc).split('\\').pop()
+        procCounts[shortProc] = (procCounts[shortProc] || 0) + 1
+      }
+      const usr = l.username || raw.TargetUserName || raw.SubjectUserName
+      if (usr && usr !== '-') {
+        userCounts[usr] = (userCounts[usr] || 0) + 1
+      }
+      const svc = raw.ServiceName || raw.TargetObject || raw.PipeName
+      if (svc && svc !== '-') {
+        svcCounts[svc] = (svcCounts[svc] || 0) + 1
+      }
+    }
+
+    const sortRare = (obj) => Object.entries(obj).sort((a, b) => a[1] - b[1]).slice(0, 6)
+    return {
+      rareProcesses: sortRare(procCounts),
+      rareUsers: sortRare(userCounts),
+      rareArtifacts: sortRare(svcCounts),
+    }
+  }, [filteredLogs])
+
+  // Distinct hosts & users for the Incident Containment Playbook dropdowns:
+  const distinctHosts = useMemo(
+    () => [...new Set(logs.map(l => l.target_host).filter(Boolean))],
+    [logs]
+  )
+  const distinctUsers = useMemo(
+    () => [...new Set(logs.map(l => l.username).filter(u => u && u !== '-'))],
+    [logs]
+  )
+
   // Reset to page 1 whenever any filter changes
   useEffect(() => { setCurrentPage(1) }, [selectedEventIds, selectedAttackerIp, keyEvidenceOnly, timeRangeIdx, searchTerm])
 
@@ -334,6 +430,8 @@ export default function Investigation() {
         free_hints_used: freeHintsUsed,
         trials_count: totalTrials,
         user_guesses: questionGuesses,
+        containment_host: containmentHost || null,
+        containment_user: containmentUser || null,
       }
       const res = await api.post(`/scenarios/${scenarioId}/submit`, payload)
       sessionStorage.setItem(`report_${scenarioId}`, JSON.stringify(res.data))
@@ -431,9 +529,21 @@ export default function Investigation() {
               <strong>⚡ Triggered Sigma Detection Rule (Static SIEM Logic)</strong>
               <p>Analyze the detection logic below to understand why this alert triggered and which Event IDs/fields to pivot on.</p>
             </div>
-            <button type="button" className="btn-sm btn-secondary" onClick={() => setShowSigmaModal(false)}>
-              Close
-            </button>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <button
+                type="button"
+                className="btn-sm btn-primary"
+                onClick={handlePivotToSigmaEvents}
+                title="Extract Event IDs from Sigma YAML and filter logs"
+                style={{ display: 'flex', alignItems: 'center', gap: 5 }}
+              >
+                <Filter size={12} />
+                Pivot to Rule Events
+              </button>
+              <button type="button" className="btn-sm btn-secondary" onClick={() => setShowSigmaModal(false)}>
+                Close
+              </button>
+            </div>
           </div>
           <pre className="sigma-code-block">{alert.sigma_rule}</pre>
         </div>
@@ -486,10 +596,28 @@ export default function Investigation() {
           {/* ── TAB 1: LOG VIEWER ── */}
           {activeLeftTab === 'logs' && (
             <>
+              {/* ─── Pivot Notification Banner ─── */}
+              {pivotNotice && (
+                <div className="pivot-notice-banner">
+                  <div className="pivot-notice-left">
+                    <Zap size={14} className="pivot-notice-icon" />
+                    <span>{pivotNotice}</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="pivot-notice-close"
+                    onClick={() => setPivotNotice(null)}
+                    title="Dismiss notice"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
+              )}
+
               {/* ─── Smart Filter Toolbar ─── */}
               <div className="smart-filter-toolbar">
 
-                {/* Row 1: Event ID chips + Key Evidence toggle */}
+                {/* Row 1: Event ID chips + Key Evidence toggle + Guided Mode + Anomaly Hunter */}
                 <div className="filter-row">
                   <div className="filter-label">
                     <Filter size={12} />
@@ -517,12 +645,36 @@ export default function Investigation() {
                   </div>
                   <button
                     type="button"
-                    className={`filter-toggle-btn ${keyEvidenceOnly ? 'active' : ''}`}
-                    onClick={() => setKeyEvidenceOnly(v => !v)}
-                    title="Show only logs marked as key evidence by the scenario author"
+                    className={`filter-toggle-btn ${guidedMode ? 'active guided-active' : ''}`}
+                    onClick={() => {
+                      setGuidedMode(g => {
+                        if (g) setKeyEvidenceOnly(false)
+                        return !g
+                      })
+                    }}
+                    title="Toggle Guided Training Mode to reveal/hide Key Evidence indicators"
                   >
-                    <Zap size={12} />
-                    Key Evidence ({keyEvidenceLogs.length})
+                    {guidedMode ? <Eye size={12} /> : <EyeOff size={12} />}
+                    {guidedMode ? 'Guided Mode (Spoilers On)' : 'SOC Realism Mode'}
+                  </button>
+                  {guidedMode && (
+                    <button
+                      type="button"
+                      className={`filter-toggle-btn ${keyEvidenceOnly ? 'active' : ''}`}
+                      onClick={() => setKeyEvidenceOnly(v => !v)}
+                    >
+                      <Zap size={12} />
+                      Key Evidence ({keyEvidenceLogs.length})
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className={`filter-toggle-btn ${showAnomalyHunter ? 'active anomaly-active' : ''}`}
+                    onClick={() => setShowAnomalyHunter(v => !v)}
+                    title="Toggle 24-bucket timeline histogram & rare value anomalies"
+                  >
+                    <Activity size={12} />
+                    Anomaly Hunter
                   </button>
                 </div>
 
@@ -668,6 +820,160 @@ export default function Investigation() {
                 )}
               </div>
 
+              {/* ─── Anomaly Hunter & Timeline Histogram Section ─── */}
+              {showAnomalyHunter && (
+                <div className="anomaly-hunter-card">
+                  <div className="anomaly-hunter-header">
+                    <div className="anomaly-header-title">
+                      <Activity size={16} style={{ color: '#c084fc' }} />
+                      <div>
+                        <strong>Activity Timeline & Rare-Value Anomaly Hunter</strong>
+                        <p>24-bucket temporal activity distribution and rare forensic aggregations across active log filter</p>
+                      </div>
+                    </div>
+                    {(timeRangeIdx[0] !== 0 || timeRangeIdx[1] !== 100) && (
+                      <button
+                        type="button"
+                        className="btn-sm btn-secondary"
+                        onClick={() => setTimeRangeIdx([0, 100])}
+                        style={{ fontSize: '0.75rem' }}
+                      >
+                        <X size={11} style={{ marginRight: 4 }} /> Reset Time Filter
+                      </button>
+                    )}
+                  </div>
+
+                  {/* 24-Bucket Histogram Bar Chart */}
+                  <div className="histogram-container">
+                    <div className="histogram-top-legend">
+                      <span>Temporal Activity Distribution (24 Buckets)</span>
+                      <div className="histogram-legend-tags">
+                        <span className="hist-tag hist-tag-normal"><span className="hist-tag-dot dot-normal" /> Normal Events</span>
+                        <span className="hist-tag hist-tag-alert"><span className="hist-tag-dot dot-alert" /> Security / Alert Events (4625, 4662, 7045, etc.)</span>
+                      </div>
+                    </div>
+
+                    <div className="histogram-bars-wrapper">
+                      {histogramBuckets.map((bucket) => {
+                        const maxCount = Math.max(1, ...histogramBuckets.map(b => b.count))
+                        const heightPct = Math.max(8, Math.round((bucket.count / maxCount) * 100))
+                        const isSelected = timeRangeIdx[0] <= bucket.startPct && timeRangeIdx[1] >= bucket.endPct
+                        const hasAlert = bucket.alertCount > 0
+
+                        return (
+                          <div
+                            key={bucket.index}
+                            className={`histogram-bar-col ${isSelected ? 'selected' : ''}`}
+                            onClick={() => {
+                              setTimeRangeIdx([bucket.startPct, bucket.endPct])
+                              setPivotNotice(`Filtered to timeline bucket: ${bucket.startTime} (${bucket.count} events)`)
+                              setTimeout(() => setPivotNotice(null), 4000)
+                            }}
+                            title={`Time: ${bucket.startTime}\nTotal Events: ${bucket.count}\nSecurity Events: ${bucket.alertCount}\nClick to slice time range`}
+                          >
+                            <div className="histogram-bar-track">
+                              <div
+                                className={`histogram-bar-fill ${hasAlert ? 'has-alerts' : ''}`}
+                                style={{ height: `${heightPct}%` }}
+                              >
+                                {bucket.alertCount > 0 && (
+                                  <div
+                                    className="histogram-bar-alert-fill"
+                                    style={{ height: `${Math.round((bucket.alertCount / Math.max(1, bucket.count)) * 100)}%` }}
+                                  />
+                                )}
+                              </div>
+                            </div>
+                            <span className="histogram-bar-label">{bucket.startTime.split(':')[0]}h</span>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Rare-Value Anomaly Aggregations */}
+                  <div className="field-anomalies-grid">
+                    {/* Rare Processes */}
+                    <div className="anomaly-group-box">
+                      <div className="anomaly-group-title">
+                        <Terminal size={13} style={{ color: '#38bdf8' }} />
+                        <span>Rare Processes ({fieldAnomalies.rareProcesses.length})</span>
+                      </div>
+                      <div className="anomaly-items-list">
+                        {fieldAnomalies.rareProcesses.length === 0 ? (
+                          <div className="anomaly-empty">No rare processes detected</div>
+                        ) : (
+                          fieldAnomalies.rareProcesses.map(([proc, cnt]) => (
+                            <button
+                              key={proc}
+                              type="button"
+                              className="anomaly-chip"
+                              onClick={() => handlePivotFromInspector(proc, 'Process')}
+                              title={`Click to pivot on process "${proc}"`}
+                            >
+                              <span className="anomaly-chip-name">{proc}</span>
+                              <span className="anomaly-chip-count">{cnt}x</span>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Rare Users */}
+                    <div className="anomaly-group-box">
+                      <div className="anomaly-group-title">
+                        <Shield size={13} style={{ color: '#f59e0b' }} />
+                        <span>Rare Accounts / Users ({fieldAnomalies.rareUsers.length})</span>
+                      </div>
+                      <div className="anomaly-items-list">
+                        {fieldAnomalies.rareUsers.length === 0 ? (
+                          <div className="anomaly-empty">No rare user accounts detected</div>
+                        ) : (
+                          fieldAnomalies.rareUsers.map(([usr, cnt]) => (
+                            <button
+                              key={usr}
+                              type="button"
+                              className="anomaly-chip"
+                              onClick={() => handlePivotFromInspector(usr, 'User')}
+                              title={`Click to pivot on user "${usr}"`}
+                            >
+                              <span className="anomaly-chip-name">{usr}</span>
+                              <span className="anomaly-chip-count">{cnt}x</span>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Rare Artifacts / Services */}
+                    <div className="anomaly-group-box">
+                      <div className="anomaly-group-title">
+                        <Database size={13} style={{ color: '#a855f7' }} />
+                        <span>Rare Services & Artifacts ({fieldAnomalies.rareArtifacts.length})</span>
+                      </div>
+                      <div className="anomaly-items-list">
+                        {fieldAnomalies.rareArtifacts.length === 0 ? (
+                          <div className="anomaly-empty">No rare artifacts detected</div>
+                        ) : (
+                          fieldAnomalies.rareArtifacts.map(([svc, cnt]) => (
+                            <button
+                              key={svc}
+                              type="button"
+                              className="anomaly-chip"
+                              onClick={() => handlePivotFromInspector(svc, 'Artifact')}
+                              title={`Click to pivot on artifact "${svc}"`}
+                            >
+                              <span className="anomaly-chip-name">{svc}</span>
+                              <span className="anomaly-chip-count">{cnt}x</span>
+                            </button>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+
               {/* ─── Color Legend & Detection Hint Bar ─── */}
               <div className="log-color-legend">
                 <div className="legend-label">
@@ -725,15 +1031,17 @@ export default function Investigation() {
                     <span className="legend-desc">Process Execution</span>
                   </div>
 
-                  <div
-                    className={`legend-pill pill-gold ${keyEvidenceOnly ? 'active' : ''}`}
-                    onClick={() => setKeyEvidenceOnly(v => !v)}
-                    title="Click to toggle key evidence"
-                  >
-                    <span className="legend-badge-bolt">⚡</span>
-                    <span className="legend-name">Gold Badge</span>
-                    <span className="legend-desc">Key Evidence</span>
-                  </div>
+                  {guidedMode && (
+                    <div
+                      className={`legend-pill pill-gold ${keyEvidenceOnly ? 'active' : ''}`}
+                      onClick={() => setKeyEvidenceOnly(v => !v)}
+                      title="Click to toggle key evidence"
+                    >
+                      <span className="legend-badge-bolt">⚡</span>
+                      <span className="legend-name">Gold Badge</span>
+                      <span className="legend-desc">Key Evidence</span>
+                    </div>
+                  )}
 
                   <div className="legend-pill pill-suspect-ip" title="IP generating abnormal authentication failures">
                     <span className="suspect-ip-dot" />
@@ -778,9 +1086,11 @@ export default function Investigation() {
                         const dateStr = dt.toLocaleDateString()
                         const timeStr = dt.toLocaleTimeString()
 
+                        const showEvidence = guidedMode && isKeyEvidence
+
                         const rowClass =
-                          isKeyEvidence
-                            ? 'key-evidence-row'
+                          showEvidence
+                            ? 'key-evidence-row guided-mode-highlight'
                             : log.event_id === 4625 || log.event_id === 4771
                             ? 'failure-event'
                             : log.event_id === 4624
@@ -824,9 +1134,9 @@ export default function Investigation() {
                                 <span className={`event-badge ${getBadgeClass(log.event_id)}`}>
                                   {log.event_id}
                                 </span>
-                                {isKeyEvidence && (
-                                  <span className="key-evidence-badge" title="Flagged as key evidence by scenario author">
-                                    ⚡
+                                {showEvidence && (
+                                  <span className="key-evidence-badge key-evidence-badge-guided" title="Flagged as key evidence (Guided Mode)">
+                                    ⚡ <span style={{ fontSize: '0.68rem', fontWeight: 700, marginLeft: 2 }}>KEY EVIDENCE</span>
                                   </span>
                                 )}
                               </td>
@@ -840,7 +1150,7 @@ export default function Investigation() {
                             {isExpanded && (
                               <tr className="log-detail-row">
                                 <td colSpan="6">
-                                  <LogInspector log={log} />
+                                  <LogInspector log={log} onPivot={handlePivotFromInspector} />
                                 </td>
                               </tr>
                             )}
@@ -899,12 +1209,12 @@ export default function Investigation() {
               ) : (
                 <div className="timeline-list">
                   {pinnedLogs.map((log, idx) => (
-                    <div key={log.id} className={`timeline-item ${log.is_key_evidence ? 'timeline-key-evidence' : ''}`}>
+                    <div key={log.id} className={`timeline-item ${guidedMode && log.is_key_evidence ? 'timeline-key-evidence' : ''}`}>
                       <div className="timeline-step-badge">{idx + 1}</div>
                       <div className="timeline-item-body">
                         <div className="timeline-item-top">
                           <span className="event-badge">Event {log.event_id}</span>
-                          {log.is_key_evidence && <span className="key-evidence-badge">⚡ Key Evidence</span>}
+                          {guidedMode && log.is_key_evidence && <span className="key-evidence-badge">⚡ Key Evidence</span>}
                           <span className="inv-ip">{new Date(log.timestamp).toLocaleString()}</span>
                           <span>User: <strong>{log.username || '—'}</strong></span>
                           <span>Source IP: <strong>{log.source_ip || '—'}</strong></span>
@@ -1109,6 +1419,65 @@ export default function Investigation() {
                 </span>
               </div>
             )}
+
+            {/* ── Incident Containment Playbook ── */}
+            <div className="incident-containment-card">
+              <div className="containment-header">
+                <ShieldAlert size={16} className="containment-icon" />
+                <div>
+                  <h4 className="containment-title">Incident Containment Playbook</h4>
+                  <p className="containment-subtitle">
+                    Select target host and compromised account for immediate automated quarantine upon incident submission.
+                  </p>
+                </div>
+              </div>
+
+              <div className="containment-fields-grid">
+                <div className="containment-field">
+                  <label className="containment-label">
+                    <Network size={12} /> Target Host to Isolate:
+                  </label>
+                  <select
+                    className="containment-select"
+                    value={containmentHost}
+                    onChange={(e) => setContainmentHost(e.target.value)}
+                  >
+                    <option value="">-- No Host Isolation Required --</option>
+                    {distinctHosts.map((h) => (
+                      <option key={h} value={h}>
+                        🖥️ {h}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="containment-field">
+                  <label className="containment-label">
+                    <Lock size={12} /> Compromised User to Suspend:
+                  </label>
+                  <select
+                    className="containment-select"
+                    value={containmentUser}
+                    onChange={(e) => setContainmentUser(e.target.value)}
+                  >
+                    <option value="">-- No Account Lockout Required --</option>
+                    {distinctUsers.map((u) => (
+                      <option key={u} value={u}>
+                        👤 {u}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              {(containmentHost || containmentUser) && (
+                <div className="containment-preview-pill">
+                  ⚡ <strong>Containment Actions Queued:</strong>
+                  {containmentHost && <span> [Network Quarantine: {containmentHost}]</span>}
+                  {containmentUser && <span> [Disable Kerberos/NTLM: {containmentUser}]</span>}
+                </div>
+              )}
+            </div>
 
             <button type="submit" className="inv-submit-btn" disabled={submitting}>
               {submitting ? (

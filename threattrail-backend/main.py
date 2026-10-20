@@ -34,9 +34,21 @@ app = FastAPI(
     version="0.4.0",
 )
 
+# ── CORS Configuration ────────────────────────────────────────────────────────
+origins_env = os.getenv("CORS_ORIGINS")
+if origins_env:
+    cors_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+else:
+    cors_origins = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,7 +56,15 @@ app.add_middleware(
 
 # ── JWT & Auth Security ───────────────────────────────────────────────────────
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "threattrail-soc-jwt-secret-key-2026")
+_DEFAULT_SECRET = "threattrail-soc-jwt-secret-key-2026"
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", _DEFAULT_SECRET)
+if SECRET_KEY == _DEFAULT_SECRET:
+    import warnings
+    warnings.warn(
+        "[ThreatTrail] JWT_SECRET_KEY is using the insecure dev default. "
+        "Set JWT_SECRET_KEY in your .env file before deploying to production!",
+        stacklevel=2,
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 
@@ -328,26 +348,48 @@ def get_profile_stats(
 # ── Trainee Endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/api/scenarios", response_model=list[ScenarioOut])
-def list_scenarios(all_status: bool = Query(False, description="Include drafts if true"), db: Session = Depends(get_db)):
-    if all_status:
+def list_scenarios(
+    all_status: bool = Query(False, description="Include drafts if true — admin only"),
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    # Only admins can see Draft scenarios
+    if all_status and current_user and current_user.role == "admin":
         return db.query(Scenario).all()
-    published = db.query(Scenario).filter(Scenario.status == "Published").all()
-    if not published:
-        return db.query(Scenario).all()
-    return published
+    # Everyone else gets only Published scenarios
+    return db.query(Scenario).filter(Scenario.status == "Published").all()
+
+
+def _check_scenario_access(scenario: Optional[Scenario], current_user: Optional[User]):
+    if not scenario:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    if scenario.status != "Published" and (not current_user or current_user.role != "admin"):
+        raise HTTPException(
+            status_code=403,
+            detail="Access restricted: This scenario is in Draft status and only accessible to administrators.",
+        )
 
 
 @app.get("/api/scenarios/{scenario_id}", response_model=ScenarioOut)
-def get_scenario_info(scenario_id: int, db: Session = Depends(get_db)):
+def get_scenario_info(
+    scenario_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
     """Fetch scenario metadata including Active Directory topology context."""
     scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
-    if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
+    _check_scenario_access(scenario, current_user)
     return scenario
 
 
 @app.get("/api/scenarios/{scenario_id}/alert", response_model=AlertOut)
-def get_scenario_alert(scenario_id: int, db: Session = Depends(get_db)):
+def get_scenario_alert(
+    scenario_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
+    _check_scenario_access(scenario, current_user)
     alert = db.query(Alert).filter(Alert.scenario_id == scenario_id).first()
     if not alert:
         raise HTTPException(status_code=404, detail="Alert not found for this scenario")
@@ -362,7 +404,11 @@ def get_scenario_logs(
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
+    scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
+    _check_scenario_access(scenario, current_user)
+
     query = db.query(Log).filter(Log.scenario_id == scenario_id)
     if event_id is not None:
         query = query.filter(Log.event_id == event_id)
@@ -380,7 +426,13 @@ def get_scenario_logs(
 
 
 @app.get("/api/scenarios/{scenario_id}/questions", response_model=list[QuestionOut])
-def get_scenario_questions(scenario_id: int, db: Session = Depends(get_db)):
+def get_scenario_questions(
+    scenario_id: int,
+    db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
+):
+    scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
+    _check_scenario_access(scenario, current_user)
     questions = db.query(Question).filter(Question.scenario_id == scenario_id).all()
     if not questions:
         raise HTTPException(status_code=404, detail="No questions found for this scenario")
@@ -392,26 +444,101 @@ def is_answer_match(user_raw: str, correct_raw: str, aliases: Optional[list[str]
     Smart SOC answer matcher:
     - Case-insensitive, whitespace-trimmed
     - Checks explicit aliases (e.g. ['CORP\\svc_backup', 'svc_backup@corp.local'])
-    - Automatically matches AD domain-prefixed usernames (e.g. 'CORP\\jdoe' == 'jdoe')
+    - Strips AD domain prefix (DOMAIN\\user) ONLY when there is exactly one backslash
+      and no drive letter (avoids matching C:\\Windows\\System32\\foo.exe incorrectly).
     """
     u = user_raw.strip().lower()
     c = correct_raw.strip().lower()
-    if not u:
+    if not u or not c:
         return False
     if u == c:
         return True
 
-    # Check domain-stripped equivalents (e.g. CORP\svc_backup -> svc_backup)
-    u_stripped = u.split("\\")[-1].split("@")[0]
-    c_stripped = c.split("\\")[-1].split("@")[0]
+    # Strip DOMAIN\user but NEVER file paths like C:\Windows\System32\lsass.exe
+    def _strip_domain(s: str) -> str:
+        # A Windows file path contains drive letters (C:) or forward slashes
+        if ":" in s or "/" in s:
+            return s
+        parts = s.split("\\")
+        # Only strip domain prefix when there is a single backslash and no drive letter
+        if len(parts) == 2 and parts[0] and not parts[0].endswith(":"):
+            return parts[1].split("@")[0]
+        return s.split("@")[0]  # strip UPN suffix (@corp.local) only
+
+    u_stripped = _strip_domain(u)
+    c_stripped = _strip_domain(c)
     if u_stripped == c_stripped and len(c_stripped) >= 3:
         return True
 
     if aliases:
         for alias in aliases:
-            if isinstance(alias, str) and u == alias.strip().lower():
-                return True
+            if isinstance(alias, str):
+                alias_clean = alias.strip().lower()
+                if u == alias_clean:
+                    return True
+                # Also try alias domain-stripping
+                if u_stripped == _strip_domain(alias_clean) and len(u_stripped) >= 3:
+                    return True
     return False
+
+
+def diagnose_analyst_mistake(user_raw: str, question: Question, scenario: Scenario) -> Optional[str]:
+    """
+    Detects common SOC analyst misconceptions and false-positive traps, returning
+    actionable coaching feedback instead of a generic 'Incorrect' message.
+    """
+    u = user_raw.strip()
+    u_low = u.lower()
+    q_text = (question.question_text or "").lower()
+    correct_low = (question.correct_answer or "").strip().lower()
+
+    if not u:
+        return None
+
+    # Trap 1: Analyst submits an Active Directory Machine Account (ending in '$') when asked for a user account
+    if u.endswith("$") and not correct_low.endswith("$"):
+        return (
+            f"⚠️ Analyst Trap Detected: '{u}' ends with '$', which indicates an Active Directory "
+            "Machine/Computer account (e.g., routine DC or workstation authentication), not a human or service user account. "
+            "Exclude accounts ending in '$' and check SubjectUserName / TargetUserName for the compromised user."
+        )
+
+    # Trap 2: Analyst confuses AES256 (0x12) with RC4-HMAC (0x17) in Kerberoasting (Event 4769)
+    if u_low in ("0x12", "18", "aes256") and correct_low in ("0x17", "23"):
+        return (
+            "⚠️ Analyst Trap Detected: '0x12' is AES256-CTS-HMAC-SHA1-96, which is normal, secure Kerberos encryption "
+            "seen in background domain traffic. Look for the anomalous Event 4769 downgraded to '0x17' (RC4-HMAC)."
+        )
+
+    # Trap 3: Analyst enters normal Kerberos service 'krbtgt' or machine SPN when asked for the Kerberoasted service
+    if u_low == "krbtgt" and correct_low != "krbtgt":
+        return (
+            "⚠️ Analyst Trap Detected: 'krbtgt' is the Kerberos Key Distribution Center service used for normal TGT requests (Event 4768). "
+            "Filter Event ID 4769 with TicketEncryptionType 0x17 to find the specific application ServiceName targeted."
+        )
+
+    # Trap 4: Analyst enters benign system process accessing LSASS (Event 10)
+    if u_low in ("svchost.exe", "msmpeng.exe", "csrss.exe", "lsass.exe", "services.exe", "wininit.exe") and "sourceimage" in q_text:
+        return (
+            f"⚠️ False Positive Trap: '{u}' is a legitimate Windows OS/Defender process that routinely interacts with LSASS. "
+            "Inspect Sysmon Event 10 where GrantedAccess is 0x1010/0x1410 and look for the non-standard SourceImage."
+        )
+
+    # Trap 5: Analyst confuses SubjectUserName ('-' or 'SYSTEM') with TargetUserName in Logon events (4624/4625)
+    if u_low in ("system", "nt authority\\system", "-") and correct_low not in ("system", "nt authority\\system"):
+        return (
+            f"⚠️ Field Confusion Trap: '{u}' is the local Subject/System context, not the user account being authenticated or compromised. "
+            "Expand the Log Inspector and check 'Target / Account User' (or 'Subject User' for 4662 DCSync)."
+        )
+
+    # Trap 6: Analyst enters the Target Domain Controller IP (10.0.0.10) instead of the Attacker Source IP
+    if u_low == "10.0.0.10" and "source ip" in q_text:
+        return (
+            "⚠️ Directionality Trap: '10.0.0.10' is the IP address of the Domain Controller (DC01.corp.local), not the attacker's source IP. "
+            "Check the 'Source IP' column for the host generating the burst of failed logons."
+        )
+
+    return None
 
 
 @app.post("/api/scenarios/{scenario_id}/verify-finding", response_model=VerifyFindingResponse)
@@ -419,16 +546,27 @@ def verify_finding(
     scenario_id: int,
     body: VerifyFindingRequest,
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
+    scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
+    _check_scenario_access(scenario, current_user)
+
     question = db.query(Question).filter(Question.id == body.question_id, Question.scenario_id == scenario_id).first()
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
 
-    is_correct = is_answer_match(body.answer, question.correct_answer, question.acceptable_answers)
+    trap_msg = None
+    if is_correct:
+        msg = "Correct finding! Excellent analysis."
+    else:
+        trap_msg = diagnose_analyst_mistake(body.answer, question, scenario)
+        msg = trap_msg if trap_msg else "Incorrect finding. Inspect the logs more closely."
+
     return VerifyFindingResponse(
         question_id=question.id,
         is_correct=is_correct,
-        message="Correct finding! Excellent analysis." if is_correct else "Incorrect finding. Inspect the logs more closely."
+        message=msg,
+        trap_msg=trap_msg
     )
 
 
@@ -438,7 +576,11 @@ def get_question_hint(
     question_id: int,
     is_free: bool = Query(False, description="Whether this hint is claimed using the free hint button"),
     db: Session = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user),
 ):
+    scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
+    _check_scenario_access(scenario, current_user)
+
     question = db.query(Question).filter(Question.id == question_id, Question.scenario_id == scenario_id).first()
     if not question:
         raise HTTPException(status_code=404, detail="Question not found")
@@ -465,7 +607,7 @@ def submit_answers(
     scenario_id: int,
     body: SubmissionRequest,
     db: Session = Depends(get_db),
-    current_user: Optional[User] = Depends(get_optional_user),
+    current_user: User = Depends(get_current_user),
 ):
     scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
     if not scenario:
@@ -474,21 +616,22 @@ def submit_answers(
     questions = db.query(Question).filter(Question.scenario_id == scenario_id).all()
     q_map = {q.id: q for q in questions}
 
+    # Deduplicate client-supplied answers by question_id to prevent score inflation exploit
+    deduped_answers: dict[int, str] = {}
+    for ans in body.answers:
+        if ans.question_id not in deduped_answers:
+            deduped_answers[ans.question_id] = ans.answer
+
     results: list[QuestionResult] = []
     correct_count = 0
     total_points = sum(q.points or 10 for q in questions)
     points_earned = 0
 
-    for ans in body.answers:
-        question = q_map.get(ans.question_id)
-        if not question:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Question {ans.question_id} does not belong to scenario {scenario_id}",
-            )
-
+    # Grade against the canonical DB question list (not the client list) to prevent omissions
+    for question in questions:
+        user_answer = deduped_answers.get(question.id, "")  # empty string = no answer submitted
         q_pts = question.points or 10
-        is_correct = is_answer_match(ans.answer, question.correct_answer, question.acceptable_answers)
+        is_correct = bool(user_answer) and is_answer_match(user_answer, question.correct_answer, question.acceptable_answers)
         if is_correct:
             correct_count += 1
             points_earned += q_pts
@@ -497,7 +640,7 @@ def submit_answers(
             QuestionResult(
                 question_id=question.id,
                 question_text=question.question_text,
-                user_answer=ans.answer,
+                user_answer=user_answer,
                 correct_answer=question.correct_answer,
                 explanation=question.explanation,
                 is_correct=is_correct,
@@ -520,8 +663,7 @@ def submit_answers(
         round((correct_count / total) * 100) if total > 0 else 0
     )
 
-    # Resolve authenticated user ID (fallback to first user in DB if unauthenticated dev mode)
-    resolved_user_id = current_user.id if current_user else 1
+    resolved_user_id = current_user.id
 
     result_record = InvestigationResult(
         user_id=resolved_user_id,
@@ -1076,8 +1218,20 @@ def extract_field_from_message(msg: str, pattern: str) -> Optional[str]:
     return valid[-1] if valid else None
 
 
+PRIORITY_EVENT_IDS = {
+    4624, 4625, 4648, 4662, 4672, 4688, 4697, 4698, 4768, 4769, 5140, 5145, 7045,
+    4103, 4104, 1, 3, 7, 8, 10, 11, 13, 17, 18, 22
+}
+
+
 @app.post("/api/admin/scenarios/{scenario_id}/upload-logs")
-async def upload_logs(scenario_id: int, file: UploadFile = File(...), db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+async def upload_logs(
+    scenario_id: int,
+    file: UploadFile = File(...),
+    target_count: int = Query(500, ge=50, le=2000, description="Target log count for smart signal preservation"),
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
     scenario = db.query(Scenario).filter(Scenario.id == scenario_id).first()
     if not scenario:
         raise HTTPException(status_code=404, detail="Scenario not found")
@@ -1085,117 +1239,205 @@ async def upload_logs(scenario_id: int, file: UploadFile = File(...), db: Sessio
     if not file.filename.endswith('.zip'):
         raise HTTPException(status_code=400, detail="Only .zip files are supported")
 
-    content = await file.read()
-    log_entries = []
+    # Safety: limit upload to 200 MB to prevent OOM
+    MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+    MAX_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
+
+    content = await file.read(MAX_UPLOAD_BYTES + 1)
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="ZIP file exceeds the 200 MB upload limit")
+
+    alert = db.query(Alert).filter(Alert.scenario_id == scenario_id).first()
+
+    def _is_key_candidate(d: dict, ev: int) -> bool:
+        if alert:
+            rule = (alert.sigma_rule or "").lower()
+            title = (alert.title or "").lower()
+            target_evs = [int(m) for m in re.findall(r"event(?:id)?[:\s]+(\d+)", rule + " " + title)]
+            if target_evs and ev in target_evs:
+                # If specific keywords are in the rule, ensure at least one is present in data
+                keywords = [w.strip(" '\"") for w in re.findall(r"['\"]([^'\"]{4,})['\"]", rule)]
+                if not keywords:
+                    return True
+                d_str = json.dumps(d).lower()
+                return any(kw in d_str for kw in keywords)
+        return False
+
+    all_raw: list[dict] = []
 
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            total_uncompressed = sum(info.file_size for info in zf.infolist())
+            if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
+                raise HTTPException(status_code=413, detail="Uncompressed ZIP archive exceeds the 250 MB size limit")
+
             for info in zf.infolist():
                 if info.filename.endswith(".json") or info.filename.endswith(".jsonl"):
                     with zf.open(info) as f:
-                        raw = f.read().decode("utf-8", errors="replace")
-                        raw_trimmed = raw.strip()
-
-                        parsed_items = []
-                        if raw_trimmed.startswith("[") and raw_trimmed.endswith("]"):
-                            try:
-                                loaded = json.loads(raw_trimmed)
-                                if isinstance(loaded, list):
-                                    parsed_items = loaded
-                            except Exception:
-                                pass
-
-                        if not parsed_items:
-                            lines = [l.strip() for l in raw_trimmed.split("\n") if l.strip()]
-                            for line in lines:
+                        for raw_line in f:
+                            line = raw_line.decode("utf-8", errors="replace").strip()
+                            if not line:
+                                continue
+                            if line.startswith("[") and line.endswith("]"):
                                 try:
-                                    item = json.loads(line)
-                                    if isinstance(item, dict):
-                                        parsed_items.append(item)
+                                    arr = json.loads(line)
+                                    if isinstance(arr, list):
+                                        all_raw.extend([x for x in arr if isinstance(x, dict)])
                                 except Exception:
-                                    continue
-
-                        for data in parsed_items:
-                            ts_str = (
-                                data.get('TimeCreated')
-                                or data.get('@timestamp')
-                                or data.get('EventTime')
-                                or data.get('UtcTime')
-                                or datetime.now().isoformat()
-                            )
+                                    pass
+                                continue
                             try:
-                                if 'T' in str(ts_str):
-                                    clean_ts = str(ts_str).replace('Z', '+00:00')
-                                    ts = datetime.fromisoformat(clean_ts).replace(tzinfo=None)
-                                else:
-                                    ts = datetime.strptime(str(ts_str)[:19], "%Y-%m-%d %H:%M:%S")
+                                item = json.loads(line.rstrip(","))
+                                if isinstance(item, dict):
+                                    all_raw.append(item)
+                                elif isinstance(item, list):
+                                    all_raw.extend([x for x in item if isinstance(x, dict)])
                             except Exception:
-                                ts = datetime.now()
-
-                            event_id_raw = data.get('EventID') or data.get('event_id') or 0
-                            if isinstance(event_id_raw, dict):
-                                event_id_raw = event_id_raw.get('$numberInt') or 0
-                            try:
-                                event_id = int(event_id_raw)
-                            except Exception:
-                                event_id = 0
-
-                            msg = data.get('Message') or ""
-
-                            source_ip = (
-                                data.get('SourceAddress')
-                                or data.get('IpAddress')
-                                or data.get('SourceIp')
-                                or data.get('SourceNetworkAddress')
-                                or extract_field_from_message(msg, r"Source Network Address:\s*([^\r\n\t]+)")
-                                or extract_field_from_message(msg, r"Source Address:\s*([^\r\n\t]+)")
-                                or extract_field_from_message(msg, r"Client Address:\s*([^\r\n\t]+)")
-                            )
-                            if source_ip in ("-", "::1", "127.0.0.1"):
-                                source_ip = data.get('IpAddress') or source_ip
-
-                            username = (
-                                data.get('TargetUserName')
-                                or data.get('AccountName')
-                                or data.get('SubjectUserName')
-                                or data.get('TargetUser')
-                                or extract_field_from_message(msg, r"Account Name:\s*([^\r\n\t]+)")
-                                or extract_field_from_message(msg, r"Target Account:\s*([^\r\n\t]+)")
-                            )
-
-                            target_host = (
-                                data.get('Hostname')
-                                or data.get('Computer')
-                                or data.get('host')
-                                or data.get('Workstation')
-                                or extract_field_from_message(msg, r"Workstation Name:\s*([^\r\n\t]+)")
-                            )
-
-                            log_entries.append(Log(
-                                scenario_id=scenario_id,
-                                event_id=event_id,
-                                timestamp=ts,
-                                source_ip=source_ip,
-                                username=username,
-                                target_host=target_host,
-                                raw_event_data=data
-                            ))
-
-                    if log_entries:
+                                continue
+                    if all_raw:
                         break
+
+        total_in_zip = len(all_raw)
+        if total_in_zip == 0:
+            raise HTTPException(status_code=400, detail="No valid JSON / JSONL event logs found in the archive")
+
+        # Smart Curation: sample noisy captures while preserving 100% of attack key evidence
+        if total_in_zip <= target_count:
+            selected_raw = all_raw
+        else:
+            key_records = []
+            priority_records = []
+            background_records = []
+            for idx, d in enumerate(all_raw):
+                ev = d.get("EventID") or d.get("event_id") or 0
+                if isinstance(ev, dict):
+                    ev = ev.get("$numberInt") or 0
+                try:
+                    ev = int(ev)
+                except Exception:
+                    ev = 0
+
+                if _is_key_candidate(d, ev):
+                    key_records.append((idx, d))
+                elif ev in PRIORITY_EVENT_IDS:
+                    priority_records.append((idx, d))
+                else:
+                    background_records.append((idx, d))
+
+            max_priority = max(0, int(target_count * 0.75) - len(key_records))
+            if len(priority_records) > max_priority and max_priority > 0:
+                step = max(1, len(priority_records) // max_priority)
+                chosen_priority = priority_records[::step][:max_priority]
+            else:
+                chosen_priority = priority_records[:max_priority]
+
+            remaining_slots = max(0, target_count - len(key_records) - len(chosen_priority))
+            if remaining_slots > 0 and background_records:
+                step_bg = max(1, len(background_records) // remaining_slots)
+                chosen_bg = background_records[::step_bg][:remaining_slots]
+            else:
+                chosen_bg = []
+
+            combined = sorted(key_records + chosen_priority + chosen_bg, key=lambda x: x[0])
+            selected_raw = [x[1] for x in combined]
+
+        _IP_PLACEHOLDERS = {"-", "", "::1", "127.0.0.1", "0.0.0.0", "::"}
+
+        def _clean_ip(val):
+            if not val or str(val).strip() in _IP_PLACEHOLDERS:
+                return None
+            v = str(val).strip()
+            if v.lower().startswith("fe80"):
+                return None
+            return v
+
+        log_entries = []
+        for data in selected_raw:
+            ts_str = (
+                data.get('TimeCreated')
+                or data.get('@timestamp')
+                or data.get('EventTime')
+                or data.get('UtcTime')
+                or datetime.now().isoformat()
+            )
+            try:
+                if 'T' in str(ts_str):
+                    clean_ts = str(ts_str).replace('Z', '+00:00')
+                    ts = datetime.fromisoformat(clean_ts).replace(tzinfo=None)
+                else:
+                    ts = datetime.strptime(str(ts_str)[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                ts = datetime.now()
+
+            event_id_raw = data.get('EventID') or data.get('event_id') or 0
+            if isinstance(event_id_raw, dict):
+                event_id_raw = event_id_raw.get('$numberInt') or 0
+            try:
+                event_id = int(event_id_raw)
+            except Exception:
+                event_id = 0
+
+            msg = data.get('Message') or ""
+
+            source_ip = (
+                _clean_ip(data.get('SourceAddress'))
+                or _clean_ip(data.get('IpAddress'))
+                or _clean_ip(data.get('SourceIp'))
+                or _clean_ip(data.get('SourceNetworkAddress'))
+                or _clean_ip(extract_field_from_message(msg, r"Source Network Address:\s*([^\r\n\t]+)"))
+                or _clean_ip(extract_field_from_message(msg, r"Source Address:\s*([^\r\n\t]+)"))
+                or _clean_ip(extract_field_from_message(msg, r"Client Address:\s*([^\r\n\t]+)"))
+            )
+
+            username = (
+                data.get('TargetUserName')
+                or data.get('AccountName')
+                or data.get('SubjectUserName')
+                or data.get('TargetUser')
+                or extract_field_from_message(msg, r"Account Name:\s*([^\r\n\t]+)")
+                or extract_field_from_message(msg, r"Target Account:\s*([^\r\n\t]+)")
+            )
+
+            target_host = (
+                data.get('Hostname')
+                or data.get('Computer')
+                or data.get('host')
+                or data.get('Workstation')
+                or extract_field_from_message(msg, r"Workstation Name:\s*([^\r\n\t]+)")
+            )
+
+            is_key = _is_key_candidate(data, event_id)
+
+            log_entries.append(Log(
+                scenario_id=scenario_id,
+                event_id=event_id,
+                timestamp=ts,
+                source_ip=source_ip,
+                username=username,
+                target_host=target_host,
+                is_key_evidence=is_key,
+                raw_event_data=data
+            ))
+
+        log_entries.sort(key=lambda x: x.timestamp)
 
         db.query(Log).filter(Log.scenario_id == scenario_id).delete()
         db.add_all(log_entries)
         db.commit()
 
+        key_count = sum(1 for l in log_entries if l.is_key_evidence)
         return {
             "status": "success",
             "logs_inserted": len(log_entries),
-            "message": f"Successfully ingested {len(log_entries)} Windows Event logs"
+            "total_in_archive": total_in_zip,
+            "key_evidence_count": key_count,
+            "message": f"Successfully ingested {len(log_entries)} Windows Event logs ({key_count} key evidence) from {total_in_zip} events in archive."
         }
 
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid zip file format")
+    except HTTPException:
+        raise
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Log ingestion error: {str(e)}")

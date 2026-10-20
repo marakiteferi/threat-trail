@@ -1,4 +1,12 @@
 import { useLocation, useParams, Link, useNavigate } from 'react-router-dom'
+import {
+  Target,
+  CheckCircle2,
+  AlertTriangle,
+  Shield,
+  Activity,
+  Zap,
+} from 'lucide-react'
 
 export default function Report() {
   const { scenarioId } = useParams()
@@ -53,6 +61,17 @@ export default function Report() {
   const pinnedIds = report.pinned_log_ids || []
   const keyEvidenceIds = report.key_evidence_log_ids || []
   const matchedPins = pinnedIds.filter((id) => keyEvidenceIds.includes(id))
+  const falsePositivePins = pinnedIds.filter((id) => !keyEvidenceIds.includes(id))
+
+  const precisionPct =
+    pinnedIds.length > 0
+      ? Math.round((matchedPins.length / pinnedIds.length) * 100)
+      : 0
+
+  const coveragePct =
+    keyEvidenceIds.length > 0
+      ? Math.round((matchedPins.length / keyEvidenceIds.length) * 100)
+      : 0
 
   return (
     <div className="report-v2">
@@ -92,11 +111,171 @@ export default function Report() {
               <strong>{report.total_questions}</strong> investigation questions correctly
               {keyEvidenceIds.length > 0 && (
                 <>
-                  {' '}and pinned <strong>{matchedPins.length}/{keyEvidenceIds.length}</strong> key evidence logs.
+                  {' '}and pinned <strong>{matchedPins.length}/{keyEvidenceIds.length}</strong> key evidence logs
+                  {pinnedIds.length > 0 && (
+                    <>
+                      {' '}(<strong>{precisionPct}%</strong> timeline precision
+                      {falsePositivePins.length > 0 && (
+                        <>, <span style={{ color: '#f87171' }}>{falsePositivePins.length} false positive{falsePositivePins.length > 1 ? 's' : ''}</span></>
+                      )}).
+                    </>
+                  )}
                 </>
               )}
             </p>
           </div>
+        </div>
+      </div>
+
+      {/* ─── Forensic Timeline & Evidence Triage Evaluation Card ─── */}
+      <div className="rpt-triage-card">
+        <div className="rpt-triage-header">
+          <div className="rpt-triage-header-left">
+            <Target size={20} className="rpt-triage-icon" />
+            <div>
+              <h3 className="rpt-triage-title">Forensic Timeline & Evidence Triage Evaluation</h3>
+              <p className="rpt-triage-subtitle">
+                Signal-to-noise ratio and false-positive evaluation of pinned timeline evidence
+              </p>
+            </div>
+          </div>
+          <div className="rpt-triage-badge-wrap">
+            <span
+              className={`rpt-precision-badge ${
+                pinnedIds.length === 0
+                  ? 'badge-empty'
+                  : falsePositivePins.length === 0
+                  ? 'badge-clean'
+                  : 'badge-noisy'
+              }`}
+            >
+              {pinnedIds.length === 0
+                ? 'No Evidence Pinned'
+                : `${precisionPct}% Timeline Precision`}
+            </span>
+          </div>
+        </div>
+
+        <div className="rpt-triage-grid">
+          {/* True Attack Logs */}
+          <div className="rpt-triage-stat-box">
+            <div className="rpt-triage-stat-label">
+              <CheckCircle2 size={14} style={{ color: '#10b981' }} />
+              <span>True Attack Logs Pinned</span>
+            </div>
+            <div className="rpt-triage-stat-val text-success">
+              {matchedPins.length} <span className="stat-sep">/</span> {keyEvidenceIds.length}
+            </div>
+            <div className="rpt-triage-bar-track">
+              <div
+                className="rpt-triage-bar-fill fill-success"
+                style={{ width: `${coveragePct}%` }}
+              />
+            </div>
+            <span className="rpt-triage-subtext">
+              {keyEvidenceIds.length === 0
+                ? 'No key evidence designated'
+                : coveragePct === 100
+                ? '100% of critical attack IOCs captured'
+                : `${coveragePct}% of key attack logs pinned`}
+            </span>
+          </div>
+
+          {/* False Positive Noise Pins */}
+          <div className="rpt-triage-stat-box">
+            <div className="rpt-triage-stat-label">
+              {falsePositivePins.length === 0 ? (
+                <Shield size={14} style={{ color: '#38bdf8' }} />
+              ) : (
+                <AlertTriangle size={14} style={{ color: '#f59e0b' }} />
+              )}
+              <span>Benign Noise (False Positives)</span>
+            </div>
+            <div
+              className={`rpt-triage-stat-val ${
+                falsePositivePins.length === 0 ? 'text-clean' : 'text-warning'
+              }`}
+            >
+              {falsePositivePins.length}
+            </div>
+            <div className="rpt-triage-bar-track">
+              <div
+                className="rpt-triage-bar-fill fill-warning"
+                style={{
+                  width: `${
+                    pinnedIds.length > 0
+                      ? Math.min(100, Math.round((falsePositivePins.length / pinnedIds.length) * 100))
+                      : 0
+                  }%`,
+                }}
+              />
+            </div>
+            <span className="rpt-triage-subtext">
+              {falsePositivePins.length === 0
+                ? '0 benign noise logs pinned — clean chain of custody'
+                : `${falsePositivePins.length} uncorroborated event(s) pinned`}
+            </span>
+          </div>
+
+          {/* Timeline Efficiency / Signal-to-Noise */}
+          <div className="rpt-triage-stat-box">
+            <div className="rpt-triage-stat-label">
+              <Activity size={14} style={{ color: '#a855f7' }} />
+              <span>Timeline Signal Ratio</span>
+            </div>
+            <div className="rpt-triage-stat-val text-purple">
+              {pinnedIds.length === 0 ? '—' : `${precisionPct}%`}
+            </div>
+            <div className="rpt-triage-bar-track">
+              <div
+                className="rpt-triage-bar-fill fill-purple"
+                style={{ width: `${precisionPct}%` }}
+              />
+            </div>
+            <span className="rpt-triage-subtext">
+              {pinnedIds.length} total event(s) submitted to timeline
+            </span>
+          </div>
+        </div>
+
+        {/* SOC Coaching Callout */}
+        <div
+          className={`rpt-coaching-box ${
+            pinnedIds.length === 0
+              ? 'coaching-neutral'
+              : falsePositivePins.length === 0 && matchedPins.length === keyEvidenceIds.length
+              ? 'coaching-clean'
+              : falsePositivePins.length > 0
+              ? 'coaching-warning'
+              : 'coaching-neutral'
+          }`}
+        >
+          <div className="coaching-header">
+            <Zap size={14} className="coaching-icon" />
+            <strong>SOC Lead Forensic Coaching:</strong>
+          </div>
+          <p className="coaching-text">
+            {pinnedIds.length === 0 ? (
+              <>
+                ⚠️ <strong>Zero Pinned Evidence:</strong> You did not pin any event logs to your attack timeline. In real-world incident response, submitting an incident report without pinning corroborating artifacts prevents escalation and legal chain-of-custody verification.
+              </>
+            ) : falsePositivePins.length === 0 && matchedPins.length === keyEvidenceIds.length ? (
+              <>
+                🌟 <strong>Flawless Evidence Triage:</strong> Your pinned timeline contains 100% true attack telemetry with zero benign background noise. This high-signal timeline allows Tier-3 incident responders and forensic leads to immediately reconstruct the attacker&apos;s actions without sorting through false leads.
+              </>
+            ) : falsePositivePins.length > 0 ? (
+              <>
+                ⚠️ <strong>High Noise Detected ({falsePositivePins.length} False Positive{falsePositivePins.length > 1 ? 's' : ''}):</strong> You pinned benign background events that were not part of the active threat vector. Keeping your forensic timeline high-signal is crucial—cluttering an incident timeline with benign noise slows down incident mitigation and confuses escalation teams.
+                {matchedPins.length < keyEvidenceIds.length && (
+                  <> Additionally, you missed {keyEvidenceIds.length - matchedPins.length} critical attack log(s).</>
+                )}
+              </>
+            ) : (
+              <>
+                🔍 <strong>Incomplete Evidence Coverage:</strong> You pinned {matchedPins.length} of {keyEvidenceIds.length} primary attack logs with zero false positives. Review the unpinned artifacts (such as logon failures, Kerberos ticket requests, or process accesses) to capture the complete kill chain.
+              </>
+            )}
+          </p>
         </div>
       </div>
 

@@ -18,11 +18,83 @@ from main import extract_field_from_message
 
 ROOT = Path(__file__).resolve().parent
 
-# High-value Windows Security, System, PowerShell, and Sysmon Event IDs
+# High-value Windows Security, System, PowerShell, and Sysmon Event IDs for sampling
 PRIORITY_EVENT_IDS = {
     4624, 4625, 4648, 4662, 4672, 4688, 4697, 4698, 4768, 4769, 5140, 5145, 7045,
     4103, 4104, 1, 3, 7, 8, 10, 11, 13, 17, 18, 22
 }
+
+
+# ── Scenario-Specific Sigma-Aligned Key Evidence Predicates ─────────────────────
+
+def is_key_evidence_dcsync(data: dict, event_id: int) -> bool:
+    """Event 4662 with critical DS-Replication GUIDs."""
+    if event_id == 4662:
+        props = str(data.get("Properties") or data.get("Message") or "").lower()
+        guids = [
+            "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2",
+            "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2",
+            "89e95b76-444d-4c62-991a-0facbeda640c",
+        ]
+        return any(g in props for g in guids)
+    return False
+
+
+def is_key_evidence_mimikatz(data: dict, event_id: int) -> bool:
+    """Sysmon Event 10 accessing LSASS with suspicious GrantedAccess or Event 4104 sekurlsa scriptblock."""
+    if event_id == 10:
+        target = str(data.get("TargetImage") or data.get("Message") or "").lower()
+        if "lsass.exe" in target:
+            ga = str(data.get("GrantedAccess") or "").lower()
+            return ga in ("0x1010", "0x1410", "0x1438") or "powershell" in str(data.get("SourceImage") or "").lower()
+        return False
+    if event_id == 4104:
+        s = str(data.get("ScriptBlockText") or data.get("Message") or "").lower()
+        return any(k in s for k in ["sekurlsa", "invoke-mimikatz", "mimikatz"])
+    return False
+
+
+def is_key_evidence_psexec(data: dict, event_id: int) -> bool:
+    """Service 7045/4697 PSEXESVC, process 1 execution of PsExec/secrets, or Event 13 LSA secrets."""
+    if event_id in (7045, 4697):
+        return "psexesvc" in str(data.get("ServiceName") or data.get("Message") or "").lower()
+    if event_id == 1:
+        cmd = str(data.get("CommandLine") or data.get("Image") or "").lower()
+        return "psexesvc" in cmd or ("secrets" in cmd and "reg" in cmd)
+    if event_id == 13:
+        target = str(data.get("TargetObject") or "").lower()
+        return "policy\\secrets" in target or ("psexesvc" in target and "imagepath" in target)
+    return False
+
+
+def is_key_evidence_dcom(data: dict, event_id: int) -> bool:
+    """Explorer spawning PowerShell or DCOM ShellWindows CLSID reference."""
+    if event_id in (1, 4688):
+        parent = str(data.get("ParentImage") or data.get("ParentProcessName") or "").lower()
+        img = str(data.get("Image") or data.get("NewProcessName") or "").lower()
+        if "explorer.exe" in parent and "powershell.exe" in img:
+            return True
+    s = str(data).lower()
+    return "9ba05972-f6a8-11cf-a442-00a0c90a8f39" in s or "shellwindows" in s
+
+
+def is_key_evidence_psh_download(data: dict, event_id: int) -> bool:
+    """PowerShell staging / netsh firewall punch / Python HTTP server execution."""
+    if event_id in (1, 4688):
+        cmd = str(data.get("CommandLine") or "").lower()
+        img = str(data.get("Image") or data.get("NewProcessName") or "").lower()
+        if "http.server" in cmd or ("netsh" in img and "python" in cmd):
+            return True
+        if any(k in cmd for k in ["invoke-webrequest", "downloadstring", "net.webclient"]):
+            return True
+    if event_id == 4104:
+        s = str(data.get("ScriptBlockText") or data.get("Message") or "").lower()
+        return any(k in s for k in ["invoke-webrequest", "downloadstring", "net.webclient", "http.server"])
+    if event_id == 22:
+        img = str(data.get("Image") or "").lower()
+        return "python" in img
+    return False
+
 
 MORDOR_SCENARIOS = [
     {
@@ -30,7 +102,7 @@ MORDOR_SCENARIOS = [
         "name": "Active Directory DCSync Attack (Covenant C2)",
         "mitre_technique": "T1003.006",
         "target_count": 350,
-        "key_event_ids": {4662, 4624},
+        "key_predicate": is_key_evidence_dcsync,
         "description": (
             "An attacker with Domain Admin-equivalent privileges used Covenant C2 to perform a "
             "DCSync attack via the MS-DRSR Directory Replication Service (DsGetNCChanges) protocol "
@@ -86,7 +158,7 @@ tags:
         "name": "Empire Mimikatz LSASS Credential Dumping",
         "mitre_technique": "T1003.001",
         "target_count": 350,
-        "key_event_ids": {10, 4688, 4104, 7},
+        "key_predicate": is_key_evidence_mimikatz,
         "description": (
             "A threat actor operating PowerShell Empire executed Mimikatz (sekurlsa::logonpasswords) "
             "on an Active Directory workstation to dump credentials from LSASS process memory. "
@@ -137,8 +209,8 @@ tags:
         "zip_name": "cmd_psexec_lsa_secrets_dump.zip",
         "name": "PsExec Lateral Movement & LSA Secrets Dump",
         "mitre_technique": "T1003.004",
-        "target_count": 300,  # Ingests all 286 events!
-        "key_event_ids": {7045, 4697, 1, 13},
+        "target_count": 300,  # Ingests all 286 events
+        "key_predicate": is_key_evidence_psexec,
         "description": (
             "An adversary used Sysinternals PsExec to execute commands as SYSTEM and dump "
             "LSA Secrets from the registry. All 286 events from the incident capture are loaded—"
@@ -186,7 +258,7 @@ tags:
         "name": "Empire Lateral Movement via DCOM ShellWindows",
         "mitre_technique": "T1021.003",
         "target_count": 350,
-        "key_event_ids": {4624, 4688, 4104, 1, 3},
+        "key_predicate": is_key_evidence_dcom,
         "description": (
             "An attacker abused Distributed Component Object Model (DCOM) ShellWindows CLSID "
             "(9BA05972-F6A8-11CF-A442-00A0C90A8F39) via explorer.exe to execute a PowerShell Empire "
@@ -235,7 +307,7 @@ tags:
         "name": "PowerShell Web Download & Staging (Invoke-WebRequest)",
         "mitre_technique": "T1059.001",
         "target_count": 350,
-        "key_event_ids": {4104, 4103, 1, 3, 22},
+        "key_predicate": is_key_evidence_psh_download,
         "description": (
             "A user workstation executed PowerShell to download a payload hosted on an adversary's "
             "Python SimpleHTTPServer. Investigate PowerShell ScriptBlock logging (Event 4104) and "
@@ -284,7 +356,7 @@ tags:
 ]
 
 
-def parse_single_record(data: dict, scenario_id: int, key_event_ids: set) -> Log:
+def parse_single_record(data: dict, scenario_id: int, key_predicate=None) -> Log:
     ts_str = (
         data.get("@timestamp")
         or data.get("TimeCreated")
@@ -306,12 +378,22 @@ def parse_single_record(data: dict, scenario_id: int, key_event_ids: set) -> Log
         event_id = 0
 
     msg = data.get("Message") or ""
+    _IP_PLACEHOLDERS = {"-", "", "::1", "127.0.0.1", "0.0.0.0", "::"}
+
+    def _clean_ip(val):
+        if not val or str(val).strip() in _IP_PLACEHOLDERS:
+            return None
+        v = str(val).strip()
+        if v.lower().startswith("fe80"):  # IPv6 link-local
+            return None
+        return v
+
     source_ip = (
-        data.get("IpAddress")
-        or data.get("SourceAddress")
-        or data.get("SourceIp")
-        or data.get("DestinationIp")
-        or extract_field_from_message(msg, r"Source Network Address:\s*([^\r\n\t]+)")
+        _clean_ip(data.get("IpAddress"))
+        or _clean_ip(data.get("SourceAddress"))
+        or _clean_ip(data.get("SourceIp"))
+        # NOTE: DestinationIp intentionally excluded — it is not the source
+        or _clean_ip(extract_field_from_message(msg, r"Source Network Address:\s*([^\r\n\t]+)"))
     )
     username = (
         data.get("TargetUserName")
@@ -326,6 +408,8 @@ def parse_single_record(data: dict, scenario_id: int, key_event_ids: set) -> Log
         or data.get("host")
     )
 
+    is_key = bool(key_predicate(data, event_id)) if key_predicate else False
+
     return Log(
         scenario_id=scenario_id,
         event_id=event_id,
@@ -333,15 +417,16 @@ def parse_single_record(data: dict, scenario_id: int, key_event_ids: set) -> Log
         source_ip=source_ip,
         username=username,
         target_host=target_host,
-        is_key_evidence=(event_id in key_event_ids),
+        is_key_evidence=is_key,
         raw_event_data=data,
     )
 
 
-def smart_sample_mordor_zip(zip_path: Path, scenario_id: int, target_count: int, key_event_ids: set):
+def smart_sample_mordor_zip(zip_path: Path, scenario_id: int, target_count: int, key_predicate=None):
     """
     Scans the entire ZIP archive so high-signal events later in the file are never lost!
-    Preserves priority/key events and evenly samples background events up to target_count.
+    Guarantees key evidence events are preserved, prioritizes security events, and samples
+    surrounding background events up to target_count sorted chronologically.
     """
     all_raw = []
     with zipfile.ZipFile(zip_path, "r") as zf:
@@ -365,6 +450,7 @@ def smart_sample_mordor_zip(zip_path: Path, scenario_id: int, target_count: int,
     if total_in_zip <= target_count:
         selected_raw = all_raw
     else:
+        key_records = []
         priority_records = []
         background_records = []
         for idx, d in enumerate(all_raw):
@@ -376,32 +462,244 @@ def smart_sample_mordor_zip(zip_path: Path, scenario_id: int, target_count: int,
             except Exception:
                 ev = 0
 
-            if ev in key_event_ids or ev in PRIORITY_EVENT_IDS:
+            # Separate key attack evidence from general priority records
+            if key_predicate and key_predicate(d, ev):
+                key_records.append((idx, d))
+            elif ev in PRIORITY_EVENT_IDS:
                 priority_records.append((idx, d))
             else:
                 background_records.append((idx, d))
 
-        # Take up to 70% from priority events (evenly spaced if huge) + fill rest with background
-        max_priority = int(target_count * 0.75)
-        if len(priority_records) > max_priority:
+        # 100% of key evidence events are ALWAYS retained
+        max_priority = max(0, int(target_count * 0.75) - len(key_records))
+        if len(priority_records) > max_priority and max_priority > 0:
             step = max(1, len(priority_records) // max_priority)
             chosen_priority = priority_records[::step][:max_priority]
         else:
-            chosen_priority = priority_records
+            chosen_priority = priority_records[:max_priority]
 
-        remaining_slots = max(0, target_count - len(chosen_priority))
+        remaining_slots = max(0, target_count - len(key_records) - len(chosen_priority))
         if remaining_slots > 0 and background_records:
             step_bg = max(1, len(background_records) // remaining_slots)
             chosen_bg = background_records[::step_bg][:remaining_slots]
         else:
             chosen_bg = []
 
-        combined = sorted(chosen_priority + chosen_bg, key=lambda x: x[0])
+        combined = sorted(key_records + chosen_priority + chosen_bg, key=lambda x: x[0])
         selected_raw = [x[1] for x in combined]
 
-    entries = [parse_single_record(d, scenario_id, key_event_ids) for d in selected_raw]
+    entries = [parse_single_record(d, scenario_id, key_predicate) for d in selected_raw]
     entries.sort(key=lambda x: x.timestamp)
     return entries, total_in_zip
+
+
+def build_dynamic_mordor_questions(item: dict, logs: list[Log]) -> list[dict]:
+    """
+    Extracts actual forensic values from the ingested Mordor key evidence logs
+    so every scenario asks 4 real log-investigation questions instead of static trivia.
+    """
+    key_logs = [l for l in logs if l.is_key_evidence] or logs
+    mitre = item["mitre_technique"]
+
+    # Helper to collect non-empty values from key logs
+    def collect_vals(*keys):
+        vals = []
+        for l in key_logs:
+            raw = l.raw_event_data or {}
+            for k in keys:
+                v = raw.get(k)
+                if v and str(v).strip() not in ("-", "", "None"):
+                    vals.append(str(v).strip())
+        return vals
+
+    hosts = [l.target_host for l in key_logs if l.target_host and l.target_host != "-"]
+    primary_host = hosts[0] if hosts else "MORDORDC.theshire.local"
+    short_host = primary_host.split(".")[0]
+
+    # 1. DCSync (T1003.006)
+    if mitre == "T1003.006":
+        actors = [
+            u for u in collect_vals("SubjectUserName", "TargetUserName")
+            if not u.endswith("$") and u.upper() not in ("SYSTEM", "ANONYMOUS LOGON")
+        ]
+        attacker_user = actors[0] if actors else "pgustavo"
+        return [
+            {
+                "question_text": "[Phase 1: Alert Triage] Which Windows Security Event ID records the directory replication access check triggered by the DCSync attack?",
+                "correct_answer": "4662",
+                "acceptable_answers": ["4662"],
+                "explanation": "Event ID 4662 ('An operation was performed on an object') logs Active Directory replication permission checks against the domain naming context.",
+                "points": 15,
+            },
+            {
+                "question_text": "[Phase 2: Attribution] Pivot on Event 4662 containing the DS-Replication-Get-Changes-All GUID (1131f6ad...). Which non-machine domain user account (SubjectUserName) executed the DCSync attack?",
+                "correct_answer": attacker_user,
+                "acceptable_answers": list({attacker_user.lower(), f"theshire\\{attacker_user.lower()}", f"shire\\{attacker_user.lower()}"}),
+                "explanation": f"While Domain Controller machine accounts (ending in '$') legitimately replicate AD changes, user account '{attacker_user}' requested replication GUID 1131f6ad-9c07-11d1-f79f-00c04fc2dcd2.",
+                "points": 25,
+            },
+            {
+                "question_text": "[Phase 3: Scope] What is the hostname of the Domain Controller targeted by the replication request?",
+                "correct_answer": primary_host,
+                "acceptable_answers": [primary_host.lower(), short_host.lower()],
+                "explanation": f"The Event 4662 replication operation was logged on Domain Controller '{primary_host}'.",
+                "points": 20,
+            },
+            {
+                "question_text": "[Phase 4: Telemetry Analysis] What hex Access Mask value is recorded in the malicious Event 4662 replication logs?",
+                "correct_answer": "0x100",
+                "acceptable_answers": ["0x100", "100", "control access"],
+                "explanation": "In Active Directory Event 4662, Access Mask 0x100 corresponds to ADS_RIGHT_DS_CONTROL_ACCESS, which is required for Extended Rights like DS-Replication-Get-Changes-All.",
+                "points": 20,
+            },
+        ]
+
+    # 2. Empire Mimikatz LSASS Dump (T1003.001)
+    if mitre == "T1003.001":
+        ev10_logs = [
+            l for l in key_logs
+            if l.event_id == 10 and str(l.raw_event_data.get("GrantedAccess", "")).lower() in ("0x1010", "0x1410", "0x1438")
+        ] or [l for l in key_logs if l.event_id == 10 and "powershell" in str(l.raw_event_data.get("SourceImage", "")).lower()] or [l for l in key_logs if l.event_id == 10]
+        src_images = [
+            str(l.raw_event_data.get("SourceImage", "")).strip()
+            for l in ev10_logs if l.raw_event_data.get("SourceImage")
+        ]
+        caller_proc = src_images[0].split("\\")[-1] if src_images else "powershell.exe"
+        access_masks = [
+            str(l.raw_event_data.get("GrantedAccess", "")).strip()
+            for l in ev10_logs if l.raw_event_data.get("GrantedAccess")
+        ]
+        primary_mask = access_masks[0] if access_masks else "0x1010"
+        return [
+            {
+                "question_text": "[Phase 1: Alert Triage] Which Windows system process is targeted in memory by Mimikatz sekurlsa::logonpasswords?",
+                "correct_answer": "lsass.exe",
+                "acceptable_answers": ["lsass.exe", "lsass", "c:\\windows\\system32\\lsass.exe"],
+                "explanation": "Sysmon Event ID 10 shows TargetImage C:\\windows\\system32\\lsass.exe being opened for memory reading.",
+                "points": 15,
+            },
+            {
+                "question_text": "[Phase 2: Process Attribution] Inspect Sysmon Event ID 10 targeting lsass.exe. Which executable (SourceImage) opened the suspicious handle to lsass.exe?",
+                "correct_answer": caller_proc,
+                "acceptable_answers": [caller_proc.lower()] + ([src_images[0].lower()] if src_images else []),
+                "explanation": f"PowerShell Empire ran Invoke-Mimikatz in memory inside '{caller_proc}', which is recorded as the SourceImage in Sysmon Event 10.",
+                "points": 25,
+            },
+            {
+                "question_text": "[Phase 3: Memory Forensics] What hex GrantedAccess code was requested on lsass.exe in the Sysmon Event 10 log?",
+                "correct_answer": primary_mask,
+                "acceptable_answers": list({m.lower() for m in access_masks} | {"0x1010", "0x1410", "0x1438"}),
+                "explanation": f"Mimikatz requests PROCESS_VM_READ | PROCESS_QUERY_LIMITED_INFORMATION ({primary_mask}) to read credential material from LSASS memory.",
+                "points": 20,
+            },
+            {
+                "question_text": "[Phase 4: Endpoint Scope] On which workstation hostname did this credential dumping attack occur?",
+                "correct_answer": primary_host,
+                "acceptable_answers": [primary_host.lower(), short_host.lower()],
+                "explanation": f"The host telemetry shows the compromise occurred on '{primary_host}'.",
+                "points": 20,
+            },
+        ]
+
+    # 3. PsExec & LSA Secrets Dump (T1003.004)
+    if mitre == "T1003.004":
+        reg_logs = [l for l in key_logs if l.event_id in (12, 13)]
+        reg_targets = [str(l.raw_event_data.get("TargetObject", "")) for l in reg_logs if l.raw_event_data.get("TargetObject")]
+        return [
+            {
+                "question_text": "[Phase 1: Lateral Movement] Which Windows service name is installed on the target host (Event ID 7045 / 4697) during the PsExec execution?",
+                "correct_answer": "PSEXESVC",
+                "acceptable_answers": ["psexesvc", "psexesvc.exe", "c:\\windows\\psexesvc.exe"],
+                "explanation": "Sysinternals PsExec drops and registers the PSEXESVC service binary (Event ID 7045 / 4697) to execute commands as SYSTEM.",
+                "points": 15,
+            },
+            {
+                "question_text": "[Phase 2: Execution Context] Under which built-in high-privilege Windows account does PSEXESVC execute its spawned child commands?",
+                "correct_answer": "SYSTEM",
+                "acceptable_answers": ["system", "nt authority\\system", "localsystem"],
+                "explanation": "PsExec runs the service as NT AUTHORITY\\SYSTEM, allowing it to read restricted HKLM\\SECURITY\\Policy\\Secrets registry keys.",
+                "points": 20,
+            },
+            {
+                "question_text": "[Phase 3: Registry Forensics] Inspect Sysmon Registry events (Event ID 12/13). Which HKLM SECURITY registry subkey tree is accessed to dump LSA Secrets?",
+                "correct_answer": "Policy\\Secrets",
+                "acceptable_answers": ["policy\\secrets", "hklm\\security\\policy\\secrets", "security\\policy\\secrets"] + [r.lower() for r in reg_targets[:3]],
+                "explanation": "LSA Secrets are stored in the registry under HKLM\\SECURITY\\Policy\\Secrets.",
+                "points": 25,
+            },
+            {
+                "question_text": "[Phase 4: Endpoint Scope] What is the hostname of the target machine where PSEXESVC was installed?",
+                "correct_answer": primary_host,
+                "acceptable_answers": [primary_host.lower(), short_host.lower()],
+                "explanation": f"The service installation and LSA secret dump occurred on host '{primary_host}'.",
+                "points": 20,
+            },
+        ]
+
+    # 4. Empire DCOM ShellWindows Lateral Movement (T1021.003)
+    if mitre == "T1021.003":
+        return [
+            {
+                "question_text": "[Phase 1: Process Lineage] When ShellWindows DCOM is abused for lateral movement, which Windows shell process acts as the ParentImage that spawns powershell.exe?",
+                "correct_answer": "explorer.exe",
+                "acceptable_answers": ["explorer.exe", "explorer", "c:\\windows\\explorer.exe"],
+                "explanation": "The ShellWindows COM class (9BA05972-F6A8-11CF-A442-00A0C90A8F39) is hosted inside explorer.exe, causing explorer.exe to spawn the attacker's child command.",
+                "points": 20,
+            },
+            {
+                "question_text": "[Phase 2: Payload Triage] Which child executable is spawned by explorer.exe to run the Empire stager (Sysmon Event 1 / Security 4688)?",
+                "correct_answer": "powershell.exe",
+                "acceptable_answers": ["powershell.exe", "powershell", "c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe"],
+                "explanation": "Explorer.exe spawns powershell.exe with an encoded (-enc / -e) Empire stager command line.",
+                "points": 20,
+            },
+            {
+                "question_text": "[Phase 3: Endpoint Scope] What is the hostname of the workstation targeted by the DCOM ShellWindows lateral movement?",
+                "correct_answer": primary_host,
+                "acceptable_answers": [primary_host.lower(), short_host.lower()],
+                "explanation": f"The remote DCOM execution occurred on '{primary_host}'.",
+                "points": 20,
+            },
+            {
+                "question_text": "[Phase 4: MITRE Mapping] What is the MITRE ATT&CK sub-technique ID for Distributed Component Object Model lateral movement?",
+                "correct_answer": "T1021.003",
+                "acceptable_answers": ["t1021.003", "t1021"],
+                "explanation": "T1021.003 is Remote Services: Distributed Component Object Model.",
+                "points": 15,
+            },
+        ]
+
+    # 5. PowerShell Web Download & Python Staging (T1059.001)
+    return [
+        {
+            "question_text": "[Phase 1: Telemetry Triage] Which Windows PowerShell Event ID records the full ScriptBlock text showing the web download command?",
+            "correct_answer": "4104",
+            "acceptable_answers": ["4104"],
+            "explanation": "PowerShell Operational Event ID 4104 records the full ScriptBlock text of executed commands.",
+            "points": 15,
+        },
+        {
+            "question_text": "[Phase 2: Command Analysis] Inspect the process creation and firewall logs. Which TCP port was opened and used by the Python http.server to stage the file?",
+            "correct_answer": "8000",
+            "acceptable_answers": ["8000", "tcp/8000"],
+            "explanation": "The logs show python -m http.server 8000 and a netsh firewall rule opening port 8000.",
+            "points": 25,
+        },
+        {
+            "question_text": "[Phase 3: Endpoint Scope] On which host (Computer / Hostname) was the PowerShell download executed?",
+            "correct_answer": primary_host,
+            "acceptable_answers": [primary_host.lower(), short_host.lower()],
+            "explanation": f"The staging and PowerShell execution took place on '{primary_host}'.",
+            "points": 20,
+        },
+        {
+            "question_text": "[Phase 4: MITRE Mapping] What is the MITRE ATT&CK sub-technique ID for PowerShell command execution?",
+            "correct_answer": "T1059.001",
+            "acceptable_answers": ["t1059.001", "t1059"],
+            "explanation": "T1059.001 is Command and Scripting Interpreter: PowerShell.",
+            "points": 15,
+        },
+    ]
 
 
 def main():
@@ -415,15 +713,18 @@ def main():
 
             existing = db.query(Scenario).filter(Scenario.name == item["name"]).first()
             if existing:
-                # Refresh logs for existing Mordor scenario with smart sampling
                 sc = existing
+                sc.ad_context = item["ad_context"]
                 db.query(Log).filter(Log.scenario_id == sc.id).delete()
+                db.query(Question).filter(Question.scenario_id == sc.id).delete()
                 logs, total_raw = smart_sample_mordor_zip(
-                    zpath, sc.id, item["target_count"], item["key_event_ids"]
+                    zpath, sc.id, item["target_count"], item.get("key_predicate")
                 )
                 db.add_all(logs)
+                for q in build_dynamic_mordor_questions(item, logs):
+                    db.add(Question(scenario_id=sc.id, **q))
                 db.commit()
-                print(f"[REFRESHED] '{item['name']}': Smart-sampled {len(logs)} / {total_raw} total ZIP events.")
+                print(f"[REFRESHED] '{item['name']}': {len(logs)} logs & 4 forensic questions updated.")
                 continue
 
             sc = Scenario(
@@ -445,24 +746,16 @@ def main():
                 )
             )
 
-            for q in item["questions"]:
-                db.add(
-                    Question(
-                        scenario_id=sc.id,
-                        question_text=q["question_text"],
-                        correct_answer=q["correct_answer"],
-                        acceptable_answers=q["acceptable_answers"],
-                        explanation=q["explanation"],
-                        points=q["points"],
-                    )
-                )
-
             logs, total_raw = smart_sample_mordor_zip(
-                zpath, sc.id, item["target_count"], item["key_event_ids"]
+                zpath, sc.id, item["target_count"], item.get("key_predicate")
             )
             db.add_all(logs)
+
+            for q in build_dynamic_mordor_questions(item, logs):
+                db.add(Question(scenario_id=sc.id, **q))
+
             db.commit()
-            print(f"[+] Imported '{item['name']}': Smart-sampled {len(logs)} / {total_raw} total ZIP events!")
+            print(f"[+] Imported '{item['name']}': Smart-sampled {len(logs)} / {total_raw} events & 4 forensic questions!")
     finally:
         db.close()
 

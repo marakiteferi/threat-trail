@@ -28,6 +28,7 @@ import {
   Calendar,
   ShieldAlert,
   Clock,
+  Search,
 } from 'lucide-react'
 
 export default function Admin() {
@@ -1373,6 +1374,117 @@ export default function Admin() {
                     onChange={(e) => setEditSigmaRule(e.target.value)}
                   />
                 </div>
+
+                {/* ── Edit Questions ─────────────────────────────── */}
+                <div className="form-section-card" style={{ marginTop: 16 }}>
+                  <div className="section-title">
+                    <span className="step-num">Q</span>
+                    <h4>Investigation Questions</h4>
+                  </div>
+                  {editQuestions.map((q, i) => (
+                    <div key={i} className="question-block" style={{ marginBottom: 14, padding: '12px', background: 'rgba(255,255,255,0.04)', borderRadius: 8, border: '1px solid rgba(255,255,255,0.08)' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                        <span style={{ fontSize: '0.78rem', color: '#94a3b8', fontWeight: 600 }}>Question {i + 1}</span>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-xs"
+                          onClick={() => setEditQuestions(editQuestions.filter((_, idx) => idx !== i))}
+                          disabled={editQuestions.length <= 1}
+                          title="Remove this question"
+                        >
+                          <X size={12} />
+                        </button>
+                      </div>
+                      <div className="form-field" style={{ marginBottom: 8 }}>
+                        <label style={{ fontSize: '0.78rem' }}>Question Text</label>
+                        <input
+                          className="admin-input"
+                          value={q.question_text}
+                          onChange={e => {
+                            const updated = [...editQuestions]
+                            updated[i] = { ...updated[i], question_text: e.target.value }
+                            setEditQuestions(updated)
+                          }}
+                          placeholder="What is the attacker's source IP?"
+                          required
+                        />
+                      </div>
+                      <div className="form-row">
+                        <div className="form-field flex-2" style={{ marginBottom: 0 }}>
+                          <label style={{ fontSize: '0.78rem' }}>Correct Answer</label>
+                          <input
+                            className="admin-input"
+                            value={q.correct_answer}
+                            onChange={e => {
+                              const updated = [...editQuestions]
+                              updated[i] = { ...updated[i], correct_answer: e.target.value }
+                              setEditQuestions(updated)
+                            }}
+                            placeholder="e.g. T1003.006"
+                            required
+                          />
+                        </div>
+                        <div className="form-field flex-1" style={{ marginBottom: 0 }}>
+                          <label style={{ fontSize: '0.78rem' }}>Points</label>
+                          <input
+                            type="number"
+                            className="admin-input"
+                            value={q.points}
+                            min={1}
+                            max={100}
+                            onChange={e => {
+                              const updated = [...editQuestions]
+                              updated[i] = { ...updated[i], points: parseInt(e.target.value) || 10 }
+                              setEditQuestions(updated)
+                            }}
+                          />
+                        </div>
+                      </div>
+                      <div className="form-field" style={{ marginTop: 8, marginBottom: 0 }}>
+                        <label style={{ fontSize: '0.78rem' }}>Explanation (shown after submission)</label>
+                        <input
+                          className="admin-input"
+                          value={q.explanation || ''}
+                          onChange={e => {
+                            const updated = [...editQuestions]
+                            updated[i] = { ...updated[i], explanation: e.target.value }
+                            setEditQuestions(updated)
+                          }}
+                          placeholder="Why is this the correct answer?"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    className="btn btn-secondary"
+                    style={{ marginTop: 4, fontSize: '0.82rem', padding: '6px 14px' }}
+                    onClick={() => setEditQuestions([...editQuestions, { question_text: '', correct_answer: '', explanation: '', points: 10 }])}
+                  >
+                    + Add Question
+                  </button>
+                </div>
+
+                {/* ── Re-upload Logs ZIP ─────────────────────────── */}
+                <div className="form-field" style={{ marginTop: 16 }}>
+                  <label>Replace Log Events Archive (optional .zip)</label>
+                  <input
+                    type="file"
+                    accept=".zip"
+                    className="admin-input"
+                    onChange={e => setEditFile(e.target.files[0] || null)}
+                    style={{ paddingTop: '8px' }}
+                  />
+                  {editFile && (
+                    <span className="field-hint" style={{ color: '#4ade80' }}>
+                      ✓ {editFile.name} — will replace all existing logs on save
+                    </span>
+                  )}
+                  {!editFile && editingScenario && (
+                    <span className="field-hint">Leave empty to keep existing logs ({editingScenario.logs_count ?? 0} events)</span>
+                  )}
+                </div>
+
               </div>
               <div className="modal-footer">
                 <button type="button" className="btn btn-secondary" onClick={() => setEditingScenario(null)}>

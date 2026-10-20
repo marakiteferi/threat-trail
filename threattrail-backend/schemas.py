@@ -38,6 +38,7 @@ class LogOut(BaseModel):
     source_ip: Optional[str] = None
     username: Optional[str] = None
     target_host: Optional[str] = None
+    is_key_evidence: bool = False
     raw_event_data: dict[str, Any]
 
     model_config = {"from_attributes": True}
@@ -85,6 +86,7 @@ class VerifyFindingResponse(BaseModel):
     question_id: int
     is_correct: bool
     message: str
+    trap_msg: Optional[str] = None
 
 
 class HintResponse(BaseModel):
@@ -102,6 +104,8 @@ class SubmissionRequest(BaseModel):
     free_hints_used: Optional[list[int]] = Field(default_factory=list)
     trials_count: Optional[int] = 1
     user_guesses: Optional[dict[str, list[str]]] = Field(default_factory=dict)
+    containment_host: Optional[str] = None
+    containment_user: Optional[str] = None
 
 
 # ── Grading result (response) ─────────────────────────────────────────────────
