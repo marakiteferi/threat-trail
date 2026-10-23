@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { Link, useNavigate, useLocation } from 'react-router-dom'
 import {
   ShieldAlert,
-  ShieldCheck,
   Key,
   Eye,
   EyeOff,
@@ -41,11 +40,6 @@ export default function AdminLogin() {
     }
   }
 
-  const fillDemoAdmin = () => {
-    setUsername('admin')
-    setPassword('admin123')
-    setError(null)
-  }
 
   return (
     <div className="auth-page auth-page-admin">
@@ -65,16 +59,7 @@ export default function AdminLogin() {
           </p>
         </div>
 
-        {/* Quick Demo Helper */}
-        <div className="auth-demo-banner demo-admin-banner">
-          <ShieldCheck size={16} className="demo-icon" />
-          <div className="demo-text">
-            <span>Quick Test: Pre-seeded administrator credentials</span>
-          </div>
-          <button type="button" onClick={fillDemoAdmin} className="demo-fill-btn demo-fill-admin">
-            Autofill Admin
-          </button>
-        </div>
+
 
         {/* Error Alert */}
         {error && (
