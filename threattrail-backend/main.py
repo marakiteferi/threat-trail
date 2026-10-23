@@ -26,6 +26,10 @@ from schemas import (
     SubmissionAdminOut, LeaderboardUserOut,
 )
 from zip_analyzer import analyze_zip_archive, extract_field_from_message
+from security_hardening import validate_required_env, SecurityHeadersMiddleware, RateLimitMiddleware
+
+# ── Startup Validation ────────────────────────────────────────────────────────
+validate_required_env()
 
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -55,6 +59,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Security Headers & Rate Limiting ─────────────────────────────────────────
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RateLimitMiddleware, max_requests=15, window_seconds=60)
 
 # ── JWT & Auth Security ───────────────────────────────────────────────────────
 
