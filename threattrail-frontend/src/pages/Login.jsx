@@ -169,11 +169,16 @@ export default function Login() {
             <span>OR</span>
           </div>
 
-          <div className="auth-admin-portal-link">
-            <ShieldAlert size={14} className="admin-lock-icon" />
-            <span>SOC Administrator?</span>
-            <Link to="/admin/login" className="admin-console-link">
-              Admin Command Console →
+          <div className="auth-admin-access-card">
+            <div className="auth-admin-access-left">
+              <ShieldAlert size={16} className="auth-admin-access-icon" />
+              <div>
+                <div className="auth-admin-access-label">Administrator?</div>
+                <div className="auth-admin-access-sub">Access the SOC Command Console</div>
+              </div>
+            </div>
+            <Link to="/admin/login" className="auth-admin-access-btn">
+              Admin Login <ArrowRight size={13} />
             </Link>
           </div>
         </div>

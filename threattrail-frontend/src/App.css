@@ -2331,6 +2331,73 @@ tr.failure-event:hover { background: rgba(239,68,68,0.04); }
   text-decoration: underline;
 }
 
+/* ── Admin Access Card (on Analyst Login) ─────────────────── */
+
+.auth-admin-access-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: rgba(168, 85, 247, 0.07);
+  border: 1px solid rgba(168, 85, 247, 0.3);
+  border-radius: 10px;
+  padding: 12px 14px;
+  transition: border-color 0.2s ease, background 0.2s ease;
+}
+
+.auth-admin-access-card:hover {
+  background: rgba(168, 85, 247, 0.12);
+  border-color: rgba(168, 85, 247, 0.5);
+}
+
+.auth-admin-access-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.auth-admin-access-icon {
+  color: #c084fc;
+  flex-shrink: 0;
+}
+
+.auth-admin-access-label {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: #c084fc;
+  line-height: 1.2;
+}
+
+.auth-admin-access-sub {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+.auth-admin-access-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(168, 85, 247, 0.2);
+  border: 1px solid rgba(168, 85, 247, 0.45);
+  color: #d8b4fe;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.auth-admin-access-btn:hover {
+  background: rgba(168, 85, 247, 0.4);
+  color: #fff;
+  text-decoration: none;
+}
+
+
 .auth-admin-note {
   font-size: 0.76rem;
   color: var(--text-muted);
