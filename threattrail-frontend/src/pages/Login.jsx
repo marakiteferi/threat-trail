@@ -6,6 +6,7 @@ import {
   Eye,
   EyeOff,
   AlertTriangle,
+  ArrowRight,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 
