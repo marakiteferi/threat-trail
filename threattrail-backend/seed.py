@@ -1,3 +1,4 @@
+import os as _os, sys as _sys
 """
 Seed script — populates ThreatTrail with 2 realistic, noisy Active Directory scenarios:
   1. Active Directory Password Spraying (MITRE T1110.003) — ~110 events
@@ -12,7 +13,7 @@ from models import User, Scenario, Alert, Log, Question, SeverityLevel
 
 random.seed(42)
 
-Base.metadata.drop_all(bind=engine)
+(_os.getenv("FORCE_RESET_DB") == "1" or "--reset" in _sys.argv) and Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 print("[+] Tables recreated.")
 

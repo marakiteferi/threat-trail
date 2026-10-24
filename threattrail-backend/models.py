@@ -116,3 +116,16 @@ class InvestigationResult(Base):
 
     user = relationship("User", back_populates="investigation_results")
     scenario = relationship("Scenario", back_populates="investigation_results")
+
+
+class QuestionAttempt(Base):
+    __tablename__ = "question_attempts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    scenario_id = Column(Integer, ForeignKey("scenarios.id", ondelete="CASCADE"), nullable=False, index=True)
+    question_id = Column(Integer, ForeignKey("questions.id", ondelete="CASCADE"), nullable=False, index=True)
+    free_hint_used = Column(Boolean, default=False, nullable=False)
+    paid_hint_used = Column(Boolean, default=False, nullable=False)
+    wrong_attempts = Column(Integer, default=0, nullable=False)
+    is_solved = Column(Boolean, default=False, nullable=False)

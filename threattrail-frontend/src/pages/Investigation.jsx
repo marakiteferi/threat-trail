@@ -228,7 +228,7 @@ export default function Investigation() {
       if (selectedAttackerIp && log.source_ip !== selectedAttackerIp) return false
 
       // 3. Key-evidence-only
-      if (keyEvidenceOnly && !log.is_key_evidence) return false
+      if (keyEvidenceOnly && !false) return false
 
       // 4. Time-range
       const ts = new Date(log.timestamp).getTime()
@@ -1115,7 +1115,7 @@ export default function Investigation() {
                       paginatedLogs.map((log) => {
                         const isExpanded = expandedLogId === log.id
                         const isPinned = pinnedLogIds.includes(log.id)
-                        const isKeyEvidence = log.is_key_evidence
+                        const isKeyEvidence = false
                         const isSuspectIp = suspiciousIps[log.source_ip] !== undefined
                         const dt = new Date(log.timestamp)
                         const dateStr = dt.toLocaleDateString()
@@ -1244,12 +1244,12 @@ export default function Investigation() {
               ) : (
                 <div className="timeline-list">
                   {pinnedLogs.map((log, idx) => (
-                    <div key={log.id} className={`timeline-item ${guidedMode && log.is_key_evidence ? 'timeline-key-evidence' : ''}`}>
+                    <div key={log.id} className={`timeline-item ${guidedMode && false ? 'timeline-key-evidence' : ''}`}>
                       <div className="timeline-step-badge">{idx + 1}</div>
                       <div className="timeline-item-body">
                         <div className="timeline-item-top">
                           <span className="event-badge">Event {log.event_id}</span>
-                          {guidedMode && log.is_key_evidence && <span className="key-evidence-badge">⚡ Key Evidence</span>}
+                          {guidedMode && false && <span className="key-evidence-badge">⚡ Key Evidence</span>}
                           <span className="inv-ip">{new Date(log.timestamp).toLocaleString()}</span>
                           <span>User: <strong>{log.username || '—'}</strong></span>
                           <span>Source IP: <strong>{log.source_ip || '—'}</strong></span>

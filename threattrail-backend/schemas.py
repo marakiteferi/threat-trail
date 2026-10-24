@@ -38,11 +38,14 @@ class LogOut(BaseModel):
     source_ip: Optional[str] = None
     username: Optional[str] = None
     target_host: Optional[str] = None
-    is_key_evidence: bool = False
     raw_event_data: dict[str, Any]
 
     model_config = {"from_attributes": True}
 
+
+
+class LogAdminOut(LogOut):
+    is_key_evidence: bool = False
 
 # ── Question ──────────────────────────────────────────────────────────────────
 
@@ -350,3 +353,22 @@ class LeaderboardUserOut(BaseModel):
     hints_used_count: int
     status: str
     badge: str
+
+
+# --- HARDENED SCHEMA OVERRIDES ---
+import re as _re
+from pydantic import field_validator as _field_validator
+
+class HardenedUserRegister(UserRegister):
+    @_field_validator("password")
+    @classmethod
+    def validate_strong_password(cls, v: str) -> str:
+        if not v or len(v) < 8:
+            raise ValueError("Password must be at least 8 characters long.")
+        if len(v) > 128:
+            raise ValueError("Password must not exceed 128 characters.")
+        if not _re.search(r"[A-Za-z]", v) or not _re.search(r"[0-9!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?]", v):
+            raise ValueError("Password must contain at least one letter and one number or special character.")
+        return v
+
+UserRegister = HardenedUserRegister

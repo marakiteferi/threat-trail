@@ -1387,3 +1387,34 @@ async def upload_logs(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Log ingestion error: {str(e)}")
+
+
+# --- AUTO-APPLIED HARDENED OVERRIDES (Issues #1-#10) ---
+import sys as _sys
+from fastapi import Request as _Request
+from fastapi.responses import JSONResponse as _JSONResponse
+from hardened_overrides import (
+    apply_hardened_routes as _apply_hardened_routes,
+    check_login_rate_limit as _check_login_rate_limit,
+    clear_login_rate_limit as _clear_login_rate_limit,
+    validate_password_policy as _validate_password_policy,
+)
+
+_apply_hardened_routes(app, _sys.modules[__name__])
+
+@app.middleware("http")
+async def _auth_hardening_middleware(request: _Request, call_next):
+    path = request.url.path
+    if request.method == "POST" and path in {"/api/auth/login", "/api/auth/admin-login"}:
+        client_ip = request.client.host if request.client else "unknown"
+        try:
+            _check_login_rate_limit(f"{client_ip}:{path}")
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", 429)
+            detail = getattr(exc, "detail", "Too many login attempts")
+            return _JSONResponse(status_code=status_code, content={"detail": detail})
+        response = await call_next(request)
+        if response.status_code == 200:
+            _clear_login_rate_limit(f"{client_ip}:{path}")
+        return response
+    return await call_next(request)
