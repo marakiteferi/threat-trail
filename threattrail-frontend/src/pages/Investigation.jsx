@@ -82,7 +82,28 @@ export default function Investigation() {
   const [logs, setLogs] = useState([])
   const [questions, setQuestions] = useState([])
   const [answers, setAnswers] = useState({})
-  const [pinnedLogIds, setPinnedLogIds] = useState([])
+  const [pinnedLogIds, setPinnedLogIds] = useState(() => {
+    try {
+      const storedUser = JSON.parse(localStorage.getItem('threattrail_user') || '{}')
+      const uid = storedUser?.id || 'anon'
+      const draftKey = `threattrail_draft_${uid}_${scenarioId}`
+      const rawDraft = localStorage.getItem(draftKey)
+      if (rawDraft) {
+        const draft = JSON.parse(rawDraft)
+        if (Array.isArray(draft.pinnedLogIds) && draft.pinnedLogIds.length > 0) {
+          return draft.pinnedLogIds.map(Number)
+        }
+      }
+      const rawPins = localStorage.getItem(`threattrail_pinned_${scenarioId}`)
+      if (rawPins) {
+        const parsed = JSON.parse(rawPins)
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return parsed.map(Number)
+        }
+      }
+    } catch {}
+    return []
+  })
 
   // ── In-App Notifications & Action Modals ──────────────────────────────────
   const [confirmingPaidHint, setConfirmingPaidHint] = useState(null)
@@ -223,8 +244,10 @@ export default function Investigation() {
             } else if (Object.keys(backendSolvedAnswers).length > 0) {
               setAnswers(backendSolvedAnswers)
             }
-            if (Array.isArray(draft.pinnedLogIds)) {
-              setPinnedLogIds(draft.pinnedLogIds)
+            if (Array.isArray(draft.pinnedLogIds) && draft.pinnedLogIds.length > 0) {
+              setPinnedLogIds(draft.pinnedLogIds.map(Number))
+            } else if (Array.isArray(progData?.pinned_log_ids) && progData.pinned_log_ids.length > 0) {
+              setPinnedLogIds(progData.pinned_log_ids.map(Number))
             }
             if (draft.questionGuesses && typeof draft.questionGuesses === 'object') {
               setQuestionGuesses(draft.questionGuesses)
@@ -427,11 +450,32 @@ export default function Investigation() {
   }, [filteredLogs, currentPage, pageSize])
 
   // ── Pinned logs ───────────────────────────────────────────────────────────
-  const pinnedLogs = useMemo(() => logs.filter((l) => pinnedLogIds.includes(l.id)), [logs, pinnedLogIds])
+  const pinnedLogs = useMemo(
+    () => logs.filter((l) => pinnedLogIds.map(Number).includes(Number(l.id))),
+    [logs, pinnedLogIds]
+  )
 
   const togglePinLog = (e, logId) => {
     e.stopPropagation()
-    setPinnedLogIds((prev) => prev.includes(logId) ? prev.filter((id) => id !== logId) : [...prev, logId])
+    const targetId = Number(logId)
+    setPinnedLogIds((prev) => {
+      const normalized = prev.map(Number)
+      const next = normalized.includes(targetId)
+        ? normalized.filter((id) => id !== targetId)
+        : [...normalized, targetId]
+
+      try {
+        const uid = user?.id || 'anon'
+        const draftKey = `threattrail_draft_${uid}_${scenarioId}`
+        const rawDraft = localStorage.getItem(draftKey)
+        const draft = rawDraft ? JSON.parse(rawDraft) : {}
+        draft.pinnedLogIds = next
+        localStorage.setItem(draftKey, JSON.stringify(draft))
+        localStorage.setItem(`threattrail_pinned_${scenarioId}`, JSON.stringify(next))
+      } catch {}
+
+      return next
+    })
   }
 
   // Toggle a single event ID in multi-select
@@ -1286,7 +1330,7 @@ export default function Investigation() {
                     ) : (
                       paginatedLogs.map((log) => {
                         const isExpanded = expandedLogId === log.id
-                        const isPinned = pinnedLogIds.includes(log.id)
+                        const isPinned = pinnedLogIds.map(Number).includes(Number(log.id))
                         const isKeyEvidence = false
                         const isSuspectIp = suspiciousIps[log.source_ip] !== undefined
                         const dt = new Date(log.timestamp)

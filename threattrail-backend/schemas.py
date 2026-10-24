@@ -153,6 +153,7 @@ class SubmissionResponse(BaseModel):
     total_points: int = 0
     points_earned: int = 0
     score_percent: int
+    score: Optional[int] = None
     pinned_log_ids: list[int] = Field(default_factory=list)
     key_evidence_log_ids: list[int] = Field(default_factory=list)
     hints_used: list[int] = Field(default_factory=list)

@@ -31,7 +31,29 @@ export default function Report() {
     )
   }
 
-  const pct = report.score_percent ?? 0
+  const pct =
+    report.score_percent !== undefined
+      ? report.score_percent
+      : report.score !== undefined
+      ? report.score
+      : report.total_points > 0
+      ? Math.round(((report.points_earned || 0) / report.total_points) * 100)
+      : 0
+
+  const correctCount =
+    report.correct_count !== undefined
+      ? report.correct_count
+      : report.results
+      ? report.results.filter((r) => r.is_correct).length
+      : 0
+
+  const totalQuestions =
+    report.total_questions !== undefined
+      ? report.total_questions
+      : report.results
+      ? report.results.length
+      : 0
+
   const radius = 50
   const circumference = 2 * Math.PI * radius
   const strokeDashoffset = circumference - (pct / 100) * circumference
@@ -107,8 +129,8 @@ export default function Report() {
               <span className="rpt-pts-total">{report.total_points} points earned</span>
             </div>
             <p className="rpt-summary">
-              You answered <strong>{report.correct_count}</strong> of{' '}
-              <strong>{report.total_questions}</strong> investigation questions correctly
+              You answered <strong>{correctCount}</strong> of{' '}
+              <strong>{totalQuestions}</strong> investigation questions correctly
               {keyEvidenceIds.length > 0 && (
                 <>
                   {' '}and pinned <strong>{matchedPins.length}/{keyEvidenceIds.length}</strong> key evidence logs

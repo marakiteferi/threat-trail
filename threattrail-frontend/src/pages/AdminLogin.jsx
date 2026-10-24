@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { Link, useNavigate, useLocation } from 'react-router-dom'
 import {
   ShieldAlert,
-  ShieldCheck,
   Key,
   Eye,
   EyeOff,
@@ -34,17 +33,15 @@ export default function AdminLogin() {
       await adminLogin(username, password)
       navigate(from, { replace: true })
     } catch (err) {
-      const msg = err.response?.data?.detail || err.message || 'Administrative login rejected'
+      const raw = err.response?.data?.detail
+      let msg = 'Administrative login rejected'
+      if (typeof raw === 'string') msg = raw
+      else if (Array.isArray(raw)) msg = raw.map(e => e.msg || e.detail || JSON.stringify(e)).join(', ')
+      else if (err.message) msg = err.message
       setError(msg)
     } finally {
       setLoading(false)
     }
-  }
-
-  const fillDemoAdmin = () => {
-    setUsername('admin')
-    setPassword('admin123')
-    setError(null)
   }
 
   return (
@@ -63,17 +60,6 @@ export default function AdminLogin() {
           <p className="auth-sub">
             Authentication portal for SOC Managers and Instructors to manage scenarios, ingest raw event artifacts, and oversee training telemetry.
           </p>
-        </div>
-
-        {/* Quick Demo Helper */}
-        <div className="auth-demo-banner demo-admin-banner">
-          <ShieldCheck size={16} className="demo-icon" />
-          <div className="demo-text">
-            <span>Quick Test: Pre-seeded administrator credentials</span>
-          </div>
-          <button type="button" onClick={fillDemoAdmin} className="demo-fill-btn demo-fill-admin">
-            Autofill Admin
-          </button>
         </div>
 
         {/* Error Alert */}

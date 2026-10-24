@@ -202,7 +202,13 @@ export default function Admin() {
         }))
       }
     } catch (err) {
-      setAddUserError(err.response?.data?.detail || 'Failed to register user')
+      const raw = err.response?.data?.detail
+      let msg = 'Failed to register user'
+      if (typeof raw === 'string') msg = raw
+      else if (Array.isArray(raw)) msg = raw.map(e => e.msg || e.detail || JSON.stringify(e)).join(', ')
+      else if (raw && typeof raw === 'object') msg = raw.msg || raw.detail || JSON.stringify(raw)
+      else if (err.message) msg = err.message
+      setAddUserError(msg)
     } finally {
       setIsAddingUser(false)
     }

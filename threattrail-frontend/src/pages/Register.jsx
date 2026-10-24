@@ -33,8 +33,13 @@ export default function Register() {
       return
     }
 
-    if (password.length < 4) {
-      setError('Password must be at least 4 characters long')
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters long')
+      return
+    }
+
+    if (!/[A-Za-z]/.test(password) || !/[0-9!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(password)) {
+      setError('Password must contain at least one letter and one number or special character')
       return
     }
 
@@ -48,7 +53,19 @@ export default function Register() {
       await register(username.trim(), password)
       navigate('/', { replace: true })
     } catch (err) {
-      const msg = err.response?.data?.detail || err.message || 'Registration failed'
+      const rawDetail = err.response?.data?.detail
+      let msg = 'Registration failed'
+      if (typeof rawDetail === 'string') {
+        msg = rawDetail
+      } else if (Array.isArray(rawDetail)) {
+        msg = rawDetail
+          .map((d) => (typeof d === 'string' ? d : d.msg || d.detail || JSON.stringify(d)))
+          .join(', ')
+      } else if (rawDetail && typeof rawDetail === 'object') {
+        msg = rawDetail.msg || rawDetail.detail || JSON.stringify(rawDetail)
+      } else if (err.message) {
+        msg = err.message
+      }
       setError(msg)
     } finally {
       setLoading(false)
@@ -108,7 +125,7 @@ export default function Register() {
                 id="reg-password"
                 type={showPassword ? 'text' : 'password'}
                 required
-                placeholder="Enter password (min 4 chars)"
+                placeholder="Enter password (min 8 chars)"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="auth-input"
@@ -124,6 +141,7 @@ export default function Register() {
                 {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
               </button>
             </div>
+            <span className="auth-field-hint">Min 8 characters (letters + numbers or symbols)</span>
           </div>
 
           <div className="auth-form-field">

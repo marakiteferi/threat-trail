@@ -5,9 +5,7 @@ import {
   Lock,
   Eye,
   EyeOff,
-  Key,
   AlertTriangle,
-  ShieldAlert,
   ArrowRight,
 } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
@@ -19,7 +17,7 @@ export default function Login() {
   const [error, setError] = useState(null)
   const [loading, setLoading] = useState(false)
 
-  const { login } = useAuth()
+  const { login, logout } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
   const from = location.state?.from?.pathname || '/'
@@ -30,20 +28,23 @@ export default function Login() {
     setLoading(true)
 
     try {
-      await login(username, password)
+      const loggedInUser = await login(username, password)
+      if (loggedInUser?.role === 'admin') {
+        logout()
+        setError('Administrator account detected. Please authenticate via the Admin Console at /admin/login.')
+        return
+      }
       navigate(from, { replace: true })
     } catch (err) {
-      const msg = err.response?.data?.detail || err.message || 'Failed to authenticate'
+      const raw = err.response?.data?.detail
+      let msg = 'Failed to authenticate'
+      if (typeof raw === 'string') msg = raw
+      else if (Array.isArray(raw)) msg = raw.map(e => e.msg || e.detail || JSON.stringify(e)).join(', ')
+      else if (err.message) msg = err.message
       setError(msg)
     } finally {
       setLoading(false)
     }
-  }
-
-  const fillDemoCreds = () => {
-    setUsername('analyst')
-    setPassword('analyst123')
-    setError(null)
   }
 
   return (
@@ -66,17 +67,6 @@ export default function Login() {
             <span>Authentication required to investigate scenarios. Please sign in to continue.</span>
           </div>
         )}
-
-        {/* Quick Demo Helper */}
-        <div className="auth-demo-banner">
-          <Key size={14} className="demo-icon" />
-          <div className="demo-text">
-            <span>Quick Test: Pre-seeded analyst credentials</span>
-          </div>
-          <button type="button" onClick={fillDemoCreds} className="demo-fill-btn">
-            Autofill Analyst
-          </button>
-        </div>
 
         {/* Error Alert */}
         {error && (
@@ -164,23 +154,6 @@ export default function Login() {
               Register analyst account →
             </Link>
           </p>
-
-          <div className="auth-divider">
-            <span>OR</span>
-          </div>
-
-          <div className="auth-admin-access-card">
-            <div className="auth-admin-access-left">
-              <ShieldAlert size={16} className="auth-admin-access-icon" />
-              <div>
-                <div className="auth-admin-access-label">Administrator?</div>
-                <div className="auth-admin-access-sub">Access the SOC Command Console</div>
-              </div>
-            </div>
-            <Link to="/admin/login" className="auth-admin-access-btn">
-              Admin Login <ArrowRight size={13} />
-            </Link>
-          </div>
         </div>
       </div>
     </div>

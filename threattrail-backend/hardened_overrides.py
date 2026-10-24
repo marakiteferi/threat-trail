@@ -441,11 +441,17 @@ def apply_hardened_routes(app: Any, main_module: Any) -> None:
             }
 
         scores = [int(t.score or 0) for t in trials]
+        latest_pins: List[int] = []
+        if trials:
+            raw_pins = trials[-1].pinned_log_ids
+            if isinstance(raw_pins, list):
+                latest_pins = [int(x) for x in raw_pins if str(x).isdigit()]
         return {
             "scenario_id": scenario.id,
             "trials_count": len(trials),
             "best_score": max(scores) if scores else None,
             "last_score": scores[-1] if scores else None,
+            "pinned_log_ids": latest_pins,
             "questions": question_progress,
         }
 
@@ -771,9 +777,14 @@ def apply_hardened_routes(app: Any, main_module: Any) -> None:
 
         raw_answers = submission.get("answers") or []
         answer_map: Dict[int, str] = {}
-        for item in raw_answers:
-            if isinstance(item, dict) and "question_id" in item:
-                answer_map[int(item["question_id"])] = str(item.get("user_answer") or item.get("answer") or "")
+        if isinstance(raw_answers, dict):
+            for q_id, ans in raw_answers.items():
+                if str(q_id).isdigit():
+                    answer_map[int(q_id)] = str(ans or "")
+        elif isinstance(raw_answers, list):
+            for item in raw_answers:
+                if isinstance(item, dict) and "question_id" in item:
+                    answer_map[int(item["question_id"])] = str(item.get("user_answer") or item.get("answer") or "")
 
         pinned_log_ids = [
             int(lid) for lid in (submission.get("pinned_log_ids") or [])
@@ -916,13 +927,18 @@ def apply_hardened_routes(app: Any, main_module: Any) -> None:
 
         db.commit()
 
+        correct_cnt = sum(1 for r in results if r.get("is_correct"))
         return {
             "scenario_id": scenario.id,
             "score": score_pct,
+            "score_percent": score_pct,
             "points_earned": points_earned,
             "total_points": total_points,
+            "correct_count": correct_cnt,
+            "total_questions": len(questions),
             "results": results,
             "pinned_log_ids": pinned_log_ids,
+            "key_evidence_log_ids": list(key_evidence_ids),
             "evidence_verified": evidence_supported,
             "matched_key_evidence_count": len(matched_evidence_pins),
             "trial_number": current_trial_number,
