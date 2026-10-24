@@ -4,6 +4,7 @@ import {
   User, Mail, Lock, Palette, Save, ArrowLeft,
   CheckCircle2, AlertTriangle, Shield, Trophy,
   Target, Zap, BookOpen, Star, TrendingUp, Clock,
+  PlayCircle,
 } from 'lucide-react'
 import api from '../api'
 import { useAuth } from '../context/AuthContext'
@@ -59,6 +60,7 @@ export default function Profile() {
   const [saving, setSaving] = useState(false)
   const [msg, setMsg] = useState(null) // { type: 'success' | 'error', text: string }
   const [stats, setStats] = useState(null)
+  const [activity, setActivity] = useState(null)
   const [loadingStats, setLoadingStats] = useState(false)
 
   const showMsg = (type, text) => {
@@ -69,8 +71,12 @@ export default function Profile() {
   const loadStats = useCallback(async () => {
     setLoadingStats(true)
     try {
-      const res = await api.get('/auth/profile/stats')
-      setStats(res.data)
+      const [statsRes, activityRes] = await Promise.all([
+        api.get('/auth/profile/stats').catch(() => ({ data: null })),
+        api.get('/profile/activity').catch(() => ({ data: null })),
+      ])
+      setStats(statsRes?.data || null)
+      setActivity(activityRes?.data || null)
     } catch {
       // stats not critical
     } finally {
@@ -418,7 +424,9 @@ export default function Profile() {
               <div className="profile-rank-banner" style={{ borderColor: `${rank.color}55`, background: `${rank.color}0e` }}>
                 <span style={{ fontSize: '2rem' }}>{rank.badge}</span>
                 <div>
-                  <div className="profile-rank-label" style={{ color: rank.color }}>{rank.label}</div>
+                  <div className="profile-rank-label" style={{ color: rank.color }}>
+                    {rank.label} {stats.rank ? `• Leaderboard Rank #${stats.rank}` : ''}
+                  </div>
                   <div className="profile-rank-sub">{stats.total_points} total points earned</div>
                 </div>
               </div>
@@ -426,11 +434,42 @@ export default function Profile() {
               {/* Stats Grid */}
               <div className="profile-stats-grid">
                 {[
-                  { label: 'Investigations', value: stats.total_investigations, icon: <BookOpen size={15} />, color: '#60a5fa' },
-                  { label: 'Scenarios Done', value: stats.scenarios_completed, icon: <Target size={15} />, color: '#34d399' },
-                  { label: 'Total Points', value: stats.total_points, icon: <Trophy size={15} />, color: '#f3c25b' },
-                  { label: 'Average Score', value: `${stats.average_score}%`, icon: <TrendingUp size={15} />, color: '#a78bfa' },
-                  { label: 'Hints Used', value: stats.hints_used, icon: <Zap size={15} />, color: '#fb923c' },
+                  {
+                    label: 'Total Attempts',
+                    value: stats.total_attempts ?? ((stats.total_trials || 0) + (activity?.active_wrong_guesses || 0)),
+                    icon: <BookOpen size={15} />,
+                    color: '#60a5fa',
+                  },
+                  {
+                    label: 'Scenarios Done',
+                    value: stats.scenarios_completed,
+                    icon: <Target size={15} />,
+                    color: '#34d399',
+                  },
+                  {
+                    label: 'Leaderboard Rank',
+                    value: stats.rank ? `#${stats.rank}` : 'Unranked',
+                    icon: <Trophy size={15} />,
+                    color: '#f3c25b',
+                  },
+                  {
+                    label: 'Total Points',
+                    value: stats.total_points,
+                    icon: <Star size={15} />,
+                    color: '#f59e0b',
+                  },
+                  {
+                    label: 'Average Score',
+                    value: `${stats.average_score}%`,
+                    icon: <TrendingUp size={15} />,
+                    color: '#a78bfa',
+                  },
+                  {
+                    label: 'Hints Used',
+                    value: stats.hints_used,
+                    icon: <Zap size={15} />,
+                    color: '#fb923c',
+                  },
                 ].map((s, i) => (
                   <div key={i} className="profile-stat-card" style={{ borderColor: `${s.color}33` }}>
                     <div className="profile-stat-icon" style={{ color: s.color }}>{s.icon}</div>
@@ -440,19 +479,59 @@ export default function Profile() {
                 ))}
               </div>
 
-              {/* Recent Activity */}
-              {stats.recent_activity?.length > 0 && (
+              {/* Active In-Progress Investigations */}
+              {activity?.in_progress && activity.in_progress.length > 0 && (
+                <div className="profile-recent-section" style={{ marginBottom: 20 }}>
+                  <h4 className="profile-recent-title" style={{ color: '#f59e0b' }}>
+                    <Zap size={14} />
+                    Active In-Progress Investigations ({activity.in_progress.length})
+                  </h4>
+                  <div className="profile-recent-list">
+                    {activity.in_progress.map((item, idx) => (
+                      <div key={idx} className="profile-recent-item" style={{ borderColor: 'rgba(245, 158, 11, 0.35)', background: 'rgba(245, 158, 11, 0.04)' }}>
+                        <div className="profile-recent-left">
+                          <Shield size={14} style={{ color: '#f59e0b' }} />
+                          <div>
+                            <span className="profile-recent-name">{item.scenario_name}</span>
+                            <div style={{ fontSize: '0.75rem', color: '#94a3b8', marginTop: 2 }}>
+                              {item.wrong_attempts > 0 ? `${item.wrong_attempts} verification attempts • ` : ''}
+                              {item.hints_used > 0 ? `${item.hints_used} hint(s) unlocked • ` : ''}
+                              {item.solved_questions > 0 ? `${item.solved_questions}/${item.total_questions} solved` : 'Active session'}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="profile-recent-right">
+                          <Link to={`/investigate/${item.scenario_id}`} className="btn-sm btn-primary" style={{ display: 'inline-flex', alignItems: 'center', gap: 6, textDecoration: 'none' }}>
+                            <PlayCircle size={13} />
+                            Resume Investigation →
+                          </Link>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Recent Activity & Trial History */}
+              {(activity?.history?.length > 0 || stats.recent_activity?.length > 0) && (
                 <div className="profile-recent-section">
                   <h4 className="profile-recent-title">
                     <Clock size={14} />
-                    Recent Investigations
+                    Investigation Activity & Trial History
                   </h4>
                   <div className="profile-recent-list">
-                    {stats.recent_activity.map((r, i) => (
+                    {(activity?.history || stats.recent_activity).map((r, i) => (
                       <div key={i} className="profile-recent-item">
                         <div className="profile-recent-left">
                           <Shield size={13} style={{ color: '#60a5fa' }} />
-                          <span className="profile-recent-name">{r.scenario_name}</span>
+                          <div>
+                            <span className="profile-recent-name">{r.scenario_name}</span>
+                            {r.trial_number && (
+                              <span style={{ marginLeft: 8, fontSize: '0.72rem', background: '#334155', color: '#94a3b8', padding: '1px 6px', borderRadius: 4 }}>
+                                Trial #{r.trial_number}
+                              </span>
+                            )}
+                          </div>
                         </div>
                         <div className="profile-recent-right">
                           <span className={`profile-score-pill ${r.score >= 80 ? 'score-great' : r.score >= 60 ? 'score-ok' : 'score-low'}`}>
@@ -469,10 +548,10 @@ export default function Profile() {
                 </div>
               )}
 
-              {stats.total_investigations === 0 && (
+              {stats.total_investigations === 0 && (!activity?.in_progress || activity.in_progress.length === 0) && (
                 <div style={{ textAlign: 'center', padding: '40px 0', color: 'var(--text-dim)' }}>
                   <Target size={36} style={{ marginBottom: 12, opacity: 0.4 }} />
-                  <div>No investigations yet. Start your first scenario!</div>
+                  <div>No investigations completed yet. Start your first scenario!</div>
                   <Link to="/" className="btn btn-primary" style={{ marginTop: 16, display: 'inline-block' }}>
                     Browse Scenarios →
                   </Link>

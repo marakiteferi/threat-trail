@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import api from '../api'
+import { useAuth } from '../context/AuthContext'
 import LogInspector from '../components/LogInspector'
 import {
   ShieldAlert,
@@ -28,6 +29,7 @@ import {
   Activity,
   Terminal,
   Database,
+  RotateCcw,
 } from 'lucide-react'
 
 const EVENT_CHEAT_SHEET = [
@@ -73,6 +75,7 @@ function classifyIPs(logs) {
 export default function Investigation() {
   const { scenarioId } = useParams()
   const navigate = useNavigate()
+  const { user } = useAuth()
 
   const [scenario, setScenario] = useState(null)
   const [alert, setAlert] = useState(null)
@@ -80,6 +83,17 @@ export default function Investigation() {
   const [questions, setQuestions] = useState([])
   const [answers, setAnswers] = useState({})
   const [pinnedLogIds, setPinnedLogIds] = useState([])
+
+  // ── In-App Notifications & Action Modals ──────────────────────────────────
+  const [confirmingPaidHint, setConfirmingPaidHint] = useState(null)
+  const [showResetModal, setShowResetModal] = useState(false)
+  const [resettingProgress, setResettingProgress] = useState(false)
+  const [toast, setToast] = useState(null)
+
+  const showToast = useCallback((message, type = 'info') => {
+    setToast({ message, type })
+    setTimeout(() => setToast(null), 4500)
+  }, [])
 
   // ── UI Toggles & Filters ──────────────────────────────────────────────────
   const [searchTerm, setSearchTerm] = useState('')
@@ -146,13 +160,86 @@ export default function Investigation() {
       api.get(`/scenarios/${scenarioId}/alert`).catch(() => ({ data: null })),
       api.get(`/scenarios/${scenarioId}/logs`),
       api.get(`/scenarios/${scenarioId}/questions`),
+      api.get(`/scenarios/${scenarioId}/progress`).catch(() => ({ data: null })),
     ])
-      .then(([scRes, alertRes, logsRes, qRes]) => {
+      .then(([scRes, alertRes, logsRes, qRes, progRes]) => {
         if (!isMounted) return
         setScenario(scRes.data)
         setAlert(alertRes.data)
         setLogs(logsRes.data || [])
         setQuestions(qRes.data || [])
+
+        // 1. Re-hydrate backend QuestionAttempt progress
+        const progData = progRes?.data
+        const backendSolvedAnswers = {}
+        const restoredTrials = {}
+        const restoredFreeHints = {}
+        const restoredPaidHints = {}
+        const restoredFreeHintsUsed = []
+        const restoredPaidHintsUsed = []
+        const restoredVerifyStatus = {}
+
+        if (progData?.questions) {
+          Object.values(progData.questions).forEach((qProg) => {
+            const qid = qProg.question_id
+            if (qProg.wrong_attempts) {
+              restoredTrials[qid] = qProg.wrong_attempts
+            }
+            if (qProg.free_hint_used) {
+              restoredFreeHints[qid] = qProg.free_hint_text || 'Free starter clue active'
+              restoredFreeHintsUsed.push(qid)
+            }
+            if (qProg.paid_hint_used) {
+              restoredPaidHints[qid] = qProg.paid_hint_text || 'Walkthrough hint unlocked'
+              restoredPaidHintsUsed.push(qid)
+            }
+            if (qProg.is_solved) {
+              restoredVerifyStatus[qid] = {
+                correct: true,
+                trap: false,
+                message: 'Verified! Your finding matches the forensic evidence.',
+              }
+              if (qProg.verified_answer) {
+                backendSolvedAnswers[qid] = qProg.verified_answer
+              }
+            }
+          })
+          setTrialsCount(restoredTrials)
+          setUnlockedFreeHints(restoredFreeHints)
+          setFreeHintsUsed(restoredFreeHintsUsed)
+          setUnlockedPaidHints(restoredPaidHints)
+          setHintsUsed(restoredPaidHintsUsed)
+          setVerifyStatus(restoredVerifyStatus)
+        }
+
+        // 2. Re-hydrate client-side draft from localStorage
+        const draftKey = `threattrail_draft_${user?.id || 'anon'}_${scenarioId}`
+        try {
+          const rawDraft = localStorage.getItem(draftKey)
+          if (rawDraft) {
+            const draft = JSON.parse(rawDraft)
+            if (draft.answers && typeof draft.answers === 'object') {
+              setAnswers({ ...draft.answers, ...backendSolvedAnswers })
+            } else if (Object.keys(backendSolvedAnswers).length > 0) {
+              setAnswers(backendSolvedAnswers)
+            }
+            if (Array.isArray(draft.pinnedLogIds)) {
+              setPinnedLogIds(draft.pinnedLogIds)
+            }
+            if (draft.questionGuesses && typeof draft.questionGuesses === 'object') {
+              setQuestionGuesses(draft.questionGuesses)
+            }
+            if (draft.containmentHost) setContainmentHost(draft.containmentHost)
+            if (draft.containmentUser) setContainmentUser(draft.containmentUser)
+          } else if (Object.keys(backendSolvedAnswers).length > 0) {
+            setAnswers(backendSolvedAnswers)
+          }
+        } catch (e) {
+          console.warn('Failed to parse draft from localStorage', e)
+          if (Object.keys(backendSolvedAnswers).length > 0) {
+            setAnswers(backendSolvedAnswers)
+          }
+        }
       })
       .catch((err) => {
         if (!isMounted) return
@@ -163,7 +250,25 @@ export default function Investigation() {
       })
 
     return () => { isMounted = false }
-  }, [scenarioId])
+  }, [scenarioId, user?.id])
+
+  // Auto-save active investigation draft to localStorage
+  useEffect(() => {
+    if (loading) return
+    const draftKey = `threattrail_draft_${user?.id || 'anon'}_${scenarioId}`
+    try {
+      const draftPayload = {
+        answers,
+        pinnedLogIds,
+        questionGuesses,
+        containmentHost,
+        containmentUser,
+      }
+      localStorage.setItem(draftKey, JSON.stringify(draftPayload))
+    } catch (e) {
+      // ignore storage quota errors
+    }
+  }, [answers, pinnedLogIds, questionGuesses, containmentHost, containmentUser, loading, user?.id, scenarioId])
 
   // ── Derived analytics ─────────────────────────────────────────────────────
 
@@ -418,34 +523,62 @@ export default function Investigation() {
     if (unlockedFreeHints[questionId]) return
 
     try {
-      const res = await api.post(`/scenarios/${scenarioId}/questions/${questionId}/hint?is_free=true`)
+      const res = await api.post(`/scenarios/${scenarioId}/questions/${questionId}/hint?is_free=true&tier=free`)
       setUnlockedFreeHints(prev => ({
         ...prev,
         [questionId]: res.data.hint
       }))
       setFreeHintsUsed(prev => prev.includes(questionId) ? prev : [...prev, questionId])
+      showToast('Free starter clue unlocked (0 pts penalty).', 'info')
     } catch (err) {
-      window.alert('Failed to retrieve free hint: ' + (err.response?.data?.detail || err.message))
+      showToast('Failed to retrieve free hint: ' + (err.response?.data?.detail || err.message), 'error')
     }
   }
 
-  const handleUnlockPaidHint = async (questionId) => {
-    if (unlockedPaidHints[questionId]) return
-
-    const confirmed = window.confirm(
-      "⚠️ FORENSIC HINT DEDUCTION\n\nUnlocking this forensic hint will deduct 15 points from your scenario score.\n\nDo you want to unlock the hint?"
-    )
-    if (!confirmed) return
+  const executeUnlockPaidHint = async (questionId) => {
+    if (unlockedPaidHints[questionId]) {
+      setConfirmingPaidHint(null)
+      return
+    }
 
     try {
-      const res = await api.post(`/scenarios/${scenarioId}/questions/${questionId}/hint?is_free=false`)
+      const res = await api.post(`/scenarios/${scenarioId}/questions/${questionId}/hint?is_free=false&tier=paid`)
       setUnlockedPaidHints(prev => ({
         ...prev,
         [questionId]: res.data.hint
       }))
       setHintsUsed(prev => prev.includes(questionId) ? prev : [...prev, questionId])
+      setConfirmingPaidHint(null)
+      showToast('Forensic walkthrough unlocked (-30% points deduction).', 'warning')
     } catch (err) {
-      window.alert('Failed to retrieve hint: ' + (err.response?.data?.detail || err.message))
+      showToast('Failed to retrieve hint: ' + (err.response?.data?.detail || err.message), 'error')
+    }
+  }
+
+  const handleResetProgress = async () => {
+    setResettingProgress(true)
+    try {
+      await api.post(`/scenarios/${scenarioId}/progress/reset`)
+      const draftKey = `threattrail_draft_${user?.id || 'anon'}_${scenarioId}`
+      localStorage.removeItem(draftKey)
+      setAnswers({})
+      setPinnedLogIds([])
+      setTrialsCount({})
+      setQuestionGuesses({})
+      setUnlockedFreeHints({})
+      setFreeHintsUsed([])
+      setUnlockedPaidHints({})
+      setHintsUsed([])
+      setVerifyStatus({})
+      setConfirmingPaidHint(null)
+      setContainmentHost('')
+      setContainmentUser('')
+      setShowResetModal(false)
+      showToast('Investigation session reset successfully.', 'success')
+    } catch (err) {
+      showToast('Failed to reset progress: ' + (err.response?.data?.detail || err.message), 'error')
+    } finally {
+      setResettingProgress(false)
     }
   }
 
@@ -469,10 +602,13 @@ export default function Investigation() {
         containment_user: containmentUser || null,
       }
       const res = await api.post(`/scenarios/${scenarioId}/submit`, payload)
+      // Purge client-side draft after final report submission
+      const draftKey = `threattrail_draft_${user?.id || 'anon'}_${scenarioId}`
+      localStorage.removeItem(draftKey)
       sessionStorage.setItem(`report_${scenarioId}`, JSON.stringify(res.data))
       navigate(`/report/${scenarioId}`, { state: { report: res.data } })
     } catch (err) {
-      window.alert(err.response?.data?.detail || 'Submission failed')
+      showToast(err.response?.data?.detail || 'Submission failed. Please check your answers.', 'error')
     } finally {
       setSubmitting(false)
     }
@@ -514,6 +650,32 @@ export default function Investigation() {
 
   return (
     <div className="investigation-v2">
+      {/* ── Top Toast Notification ── */}
+      {toast && (
+        <div style={{
+          position: 'fixed',
+          top: '20px',
+          right: '24px',
+          zIndex: 9999,
+          background: toast.type === 'error' ? '#991b1b' : toast.type === 'warning' ? '#b45309' : '#065f46',
+          color: '#fff',
+          padding: '10px 18px',
+          borderRadius: '8px',
+          boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '10px',
+          fontSize: '0.875rem',
+          fontWeight: 500,
+        }}>
+          {toast.type === 'error' ? <AlertTriangle size={16} /> : toast.type === 'warning' ? <AlertTriangle size={16} /> : <CheckCircle2 size={16} />}
+          <span>{toast.message}</span>
+          <button type="button" onClick={() => setToast(null)} style={{ background: 'transparent', border: 'none', color: '#fff', cursor: 'pointer', padding: 0, marginLeft: 8 }}>
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
       {/* ── Top Alert Banner ── */}
       {alert && (
         <div
@@ -544,6 +706,16 @@ export default function Investigation() {
               </button>
             )}
             <span className="inv-log-count">{logs.length} Events Captured</span>
+            <button
+              type="button"
+              className="soc-tool-btn"
+              onClick={() => setShowResetModal(true)}
+              title="Reset investigation session progress and start fresh"
+              style={{ color: '#f87171', borderColor: 'rgba(239, 68, 68, 0.4)' }}
+            >
+              <RotateCcw size={14} />
+              <span>Reset Progress</span>
+            </button>
             <button
               type="button"
               className="inv-back-btn"
@@ -1413,18 +1585,72 @@ export default function Investigation() {
                       <div className="unlocked-hint-box">
                         <div className="unlocked-hint-header">
                           <Lightbulb size={13} className="hint-bulb-icon" />
-                          <span className="hint-header-paid">💡 Forensic Walkthrough (-15 pts deduction applied):</span>
+                          <span className="hint-header-paid">💡 Forensic Walkthrough (-30% points deduction applied):</span>
                         </div>
                         <p className="unlocked-hint-text">{unlockedPaidHints[q.id]}</p>
+                      </div>
+                    ) : confirmingPaidHint === q.id ? (
+                      <div className="paid-hint-warning-card" style={{
+                        background: 'rgba(239, 68, 68, 0.08)',
+                        border: '1px solid rgba(239, 68, 68, 0.35)',
+                        borderRadius: '8px',
+                        padding: '12px 14px',
+                        marginTop: '6px',
+                        width: '100%',
+                      }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: '#f87171', fontWeight: 600, fontSize: '0.85rem', marginBottom: '6px' }}>
+                          <AlertTriangle size={15} />
+                          <span>Penalty Confirmation (-30% Points Deduction)</span>
+                        </div>
+                        <p style={{ margin: '0 0 10px 0', fontSize: '0.82rem', color: '#cbd5e1', lineHeight: '1.4' }}>
+                          Unlocking this walkthrough hint will permanently deduct <strong>30% ({Math.max(1, Math.round((q.points || 10) * 0.3))} pts)</strong> from this question's points. Do you want to proceed?
+                        </p>
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                          <button
+                            type="button"
+                            onClick={() => executeUnlockPaidHint(q.id)}
+                            style={{
+                              background: '#dc2626',
+                              color: '#fff',
+                              border: 'none',
+                              borderRadius: '6px',
+                              padding: '6px 14px',
+                              fontSize: '0.8rem',
+                              fontWeight: 600,
+                              cursor: 'pointer',
+                              display: 'inline-flex',
+                              alignItems: 'center',
+                              gap: '6px',
+                            }}
+                          >
+                            <Lightbulb size={13} />
+                            Confirm & Unlock (-30%)
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmingPaidHint(null)}
+                            style={{
+                              background: 'transparent',
+                              color: '#94a3b8',
+                              border: '1px solid #475569',
+                              borderRadius: '6px',
+                              padding: '6px 14px',
+                              fontSize: '0.8rem',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            Cancel
+                          </button>
+                        </div>
                       </div>
                     ) : wrongCount >= 2 ? (
                       <button
                         type="button"
                         className="btn-unlock-hint"
-                        onClick={() => handleUnlockPaidHint(q.id)}
+                        onClick={() => setConfirmingPaidHint(q.id)}
                       >
                         <Lightbulb size={13} />
-                        <span>💡 Unlock Forensic Hint (-15 pts deduction)</span>
+                        <span>💡 Unlock Forensic Walkthrough (-30% points)</span>
                       </button>
                     ) : (
                       <div className="hint-locked-badge" title="Trainees must attempt at least 2 incorrect findings before hint unlocks">
@@ -1450,7 +1676,7 @@ export default function Investigation() {
               <div className="hint-penalty-alert">
                 <AlertTriangle size={14} style={{ flexShrink: 0 }} />
                 <span>
-                  <strong>Hint Penalty Notice:</strong> You unlocked {hintsUsed.length} forensic hint(s). A total deduction of <strong>{hintsUsed.length * 15} points</strong> will be subtracted from your final score.
+                  <strong>Hint Penalty Notice:</strong> You unlocked {hintsUsed.length} forensic walkthrough(s). A deduction of <strong>30% points per unlocked question</strong> will be factored into your final score.
                 </span>
               </div>
             )}
@@ -1516,6 +1742,78 @@ export default function Investigation() {
           </form>
         </div>
       </div>
+
+      {/* ── Reset Progress Confirmation Modal ── */}
+      {showResetModal && (
+        <div style={{
+          position: 'fixed',
+          inset: 0,
+          background: 'rgba(0, 0, 0, 0.75)',
+          backdropFilter: 'blur(4px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 9999,
+          padding: '20px',
+        }}>
+          <div style={{
+            background: '#131b2e',
+            border: '1px solid rgba(239, 68, 68, 0.4)',
+            borderRadius: '12px',
+            width: '100%',
+            maxWidth: '460px',
+            padding: '24px',
+            boxShadow: '0 20px 40px rgba(0,0,0,0.6)',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', color: '#f87171', marginBottom: '12px' }}>
+              <RotateCcw size={20} />
+              <h3 style={{ margin: 0, fontSize: '1.1rem', fontWeight: 600 }}>Reset Investigation Session</h3>
+            </div>
+            <p style={{ color: '#94a3b8', fontSize: '0.875rem', lineHeight: '1.5', margin: '0 0 20px 0' }}>
+              Are you sure you want to reset your active progress for this scenario?
+              This will clear your draft answers, unpin logs, and wipe server-side verification attempts so you can start fresh.
+            </p>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px' }}>
+              <button
+                type="button"
+                onClick={() => setShowResetModal(false)}
+                disabled={resettingProgress}
+                style={{
+                  background: 'transparent',
+                  border: '1px solid #334155',
+                  color: '#94a3b8',
+                  padding: '8px 16px',
+                  borderRadius: '6px',
+                  fontSize: '0.85rem',
+                  cursor: 'pointer',
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleResetProgress}
+                disabled={resettingProgress}
+                style={{
+                  background: '#dc2626',
+                  border: 'none',
+                  color: '#fff',
+                  padding: '8px 18px',
+                  borderRadius: '6px',
+                  fontSize: '0.85rem',
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '6px',
+                }}
+              >
+                {resettingProgress ? 'Resetting...' : 'Confirm Reset'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

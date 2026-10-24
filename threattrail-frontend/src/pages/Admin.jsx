@@ -29,6 +29,7 @@ import {
   ShieldAlert,
   Clock,
   Search,
+  Shield,
 } from 'lucide-react'
 
 export default function Admin() {
@@ -109,6 +110,10 @@ export default function Admin() {
   // Delete User Confirmation state
   const [userToDelete, setUserToDelete] = useState(null)
   const [isDeletingUser, setIsDeletingUser] = useState(false)
+
+  // Toggle User Role Confirmation state
+  const [userToToggleRole, setUserToToggleRole] = useState(null)
+  const [isTogglingRole, setIsTogglingRole] = useState(false)
 
   // Reset User Password state
   const [userToResetPassword, setUserToResetPassword] = useState(null)
@@ -226,16 +231,19 @@ export default function Admin() {
     }
   }
 
-  const handleToggleUserRole = async (targetUser) => {
+  const handleToggleUserRole = (targetUser) => {
     if (currentAdmin && (targetUser.id === currentAdmin.id || targetUser.username === currentAdmin.username)) {
-      window.alert("You cannot change the role of your own logged-in administrator account.")
+      showToast("You cannot change the role of your own logged-in administrator account.", "error")
       return
     }
+    setUserToToggleRole(targetUser)
+  }
+
+  const confirmToggleUserRole = async () => {
+    if (!userToToggleRole) return
+    setIsTogglingRole(true)
+    const targetUser = userToToggleRole
     const nextRole = targetUser.role === 'admin' ? 'user' : 'admin'
-    const confirmPrompt = targetUser.role === 'admin'
-      ? `Demote '${targetUser.username}' to regular Trainee?`
-      : `Promote '${targetUser.username}' to System Administrator?`
-    if (!window.confirm(confirmPrompt)) return
 
     try {
       await api.patch(`/admin/users/${targetUser.id}/role`, { role: nextRole })
@@ -248,8 +256,11 @@ export default function Admin() {
           total_trainees: nextRole === 'user' ? (prev.total_trainees || 0) + 1 : Math.max(0, (prev.total_trainees || 1) - 1),
         }))
       }
+      setUserToToggleRole(null)
     } catch (err) {
       showToast(err.response?.data?.detail || 'Failed to update user role', 'error')
+    } finally {
+      setIsTogglingRole(false)
     }
   }
 
@@ -1218,17 +1229,27 @@ export default function Admin() {
                         <span className="db-mitre-badge">{sub.mitre_technique}</span>
                       </td>
                       <td>
-                        <span className={`score-badge ${sub.score >= 80 ? 'high' : sub.score >= 50 ? 'medium' : 'low'}`}>
-                          {sub.score}%
-                        </span>
+                        {sub.status === 'In Progress' ? (
+                          <span className="score-badge medium" style={{ background: 'rgba(245, 158, 11, 0.15)', color: '#f59e0b', border: '1px solid rgba(245, 158, 11, 0.4)' }}>
+                            In Progress
+                          </span>
+                        ) : (
+                          <span className={`score-badge ${sub.score >= 80 ? 'high' : sub.score >= 50 ? 'medium' : 'low'}`}>
+                            {sub.score}%
+                          </span>
+                        )}
                       </td>
                       <td>
-                        <strong>{sub.points_earned}</strong> / {sub.total_points} pts
+                        {sub.status === 'In Progress' ? (
+                          <span style={{ color: '#94a3b8' }}>Active Session</span>
+                        ) : (
+                          <><strong>{sub.points_earned}</strong> / {sub.total_points} pts</>
+                        )}
                       </td>
                       <td>
                         <span className="trials-count-badge">
                           <Activity size={12} />
-                          {sub.trials_count} trial{sub.trials_count > 1 ? 's' : ''}
+                          {sub.trials_count} attempt{sub.trials_count !== 1 ? 's' : ''}
                         </span>
                       </td>
                       <td>
@@ -1250,7 +1271,13 @@ export default function Admin() {
                       </td>
                       <td>
                         <span className="date-sub-text">
-                          {sub.submitted_at ? new Date(sub.submitted_at).toLocaleString() : 'Recent'}
+                          {sub.status === 'In Progress' ? (
+                            <span style={{ color: '#f59e0b', fontWeight: 600 }}>Active Now</span>
+                          ) : sub.submitted_at ? (
+                            new Date(sub.submitted_at).toLocaleString()
+                          ) : (
+                            'Recent'
+                          )}
                         </span>
                       </td>
                       <td>
@@ -1293,8 +1320,11 @@ export default function Admin() {
             <div className="modal-body">
               <div className="submission-summary-bar">
                 <div>Scenario: <strong>{selectedSubmission.scenario_name}</strong></div>
-                <div>Score: <strong>{selectedSubmission.score}% ({selectedSubmission.points_earned}/{selectedSubmission.total_points} pts)</strong></div>
-                <div>Total Trials: <strong>{selectedSubmission.trials_count}</strong></div>
+                <div>Status: <strong style={{ color: selectedSubmission.status === 'In Progress' ? '#f59e0b' : '#34d399' }}>{selectedSubmission.status || 'Completed'}</strong></div>
+                {selectedSubmission.status !== 'In Progress' && (
+                  <div>Score: <strong>{selectedSubmission.score}% ({selectedSubmission.points_earned}/{selectedSubmission.total_points} pts)</strong></div>
+                )}
+                <div>Total Attempts: <strong>{selectedSubmission.trials_count}</strong></div>
                 <div>Hints Used: <strong>{selectedSubmission.hints_used?.length || 0} (-{selectedSubmission.hint_penalty || 0} pts)</strong></div>
               </div>
 
@@ -1987,6 +2017,62 @@ export default function Admin() {
                 disabled={isDeletingUser}
               >
                 {isDeletingUser ? 'Deleting User...' : 'Yes, Delete User'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── MODAL: ROLE CHANGE CONFIRMATION ─────────────────────────────────── */}
+      {userToToggleRole && (
+        <div className="modal-backdrop">
+          <div className="modal-card modal-sm">
+            <div className="modal-header">
+              <h3>
+                <Shield size={20} color={userToToggleRole.role === 'admin' ? '#f59e0b' : '#3b82f6'} style={{ verticalAlign: 'middle', marginRight: '8px' }} />
+                {userToToggleRole.role === 'admin' ? 'Demote User Account' : 'Promote to Administrator'}
+              </h3>
+              <button
+                className="modal-close-btn"
+                onClick={() => setUserToToggleRole(null)}
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="modal-body-padding">
+              <p>
+                {userToToggleRole.role === 'admin' ? (
+                  <>
+                    Are you sure you want to demote <strong>"{userToToggleRole.username}"</strong> from <strong>Administrator</strong> to regular <strong>SOC Trainee</strong>?
+                  </>
+                ) : (
+                  <>
+                    Are you sure you want to promote <strong>"{userToToggleRole.username}"</strong> to <strong>System Administrator</strong>?
+                  </>
+                )}
+              </p>
+              <p className="text-dim" style={{ marginTop: '10px', fontSize: '0.88rem', lineHeight: '1.4' }}>
+                {userToToggleRole.role === 'admin'
+                  ? 'They will lose administrative access to scenario authoring, log uploads, and user administration.'
+                  : 'They will be granted full administrative rights, including creating scenarios, uploading logs, and managing users.'}
+              </p>
+            </div>
+            <div className="modal-footer">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={() => setUserToToggleRole(null)}
+                disabled={isTogglingRole}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className={userToToggleRole.role === 'admin' ? 'btn btn-warning' : 'btn btn-primary'}
+                onClick={confirmToggleUserRole}
+                disabled={isTogglingRole}
+              >
+                {isTogglingRole ? 'Updating...' : userToToggleRole.role === 'admin' ? 'Confirm Demotion' : 'Confirm Promotion'}
               </button>
             </div>
           </div>

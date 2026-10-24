@@ -12,6 +12,15 @@ class ScenarioOut(BaseModel):
     mitre_technique: str
     status: str = "Draft"
     ad_context: Optional[dict[str, Any]] = None
+    severity: Optional[str] = "High"
+    alert_title: Optional[str] = None
+    trials_count: Optional[int] = 0
+    attempts_count: Optional[int] = 0
+    best_score: Optional[int] = None
+    last_score: Optional[int] = None
+    in_progress: Optional[bool] = False
+    question_count: Optional[int] = 0
+    log_count: Optional[int] = 0
 
     model_config = {"from_attributes": True}
 
@@ -338,6 +347,7 @@ class SubmissionAdminOut(BaseModel):
     hint_penalty: int = 0
     trials_count: int = 1
     user_guesses: Optional[dict[str, Any]] = Field(default_factory=dict)
+    status: str = "Completed"
     submitted_at: Optional[str] = None
 
 

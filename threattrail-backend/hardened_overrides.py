@@ -247,6 +247,7 @@ def apply_hardened_routes(app: Any, main_module: Any) -> None:
 
     # Remove existing routes that we are overriding so our hardened routes take precedence
     overridden_paths = {
+        ("/api/scenarios", "GET"),
         ("/api/scenarios/{scenario_id}", "GET"),
         ("/api/scenarios/{scenario_id}/alerts", "GET"),
         ("/api/scenarios/{scenario_id}/logs", "GET"),
@@ -266,13 +267,306 @@ def apply_hardened_routes(app: Any, main_module: Any) -> None:
         )
     ]
 
+    SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    SEVERITY_LABEL = {4: "Critical", 3: "High", 2: "Medium", 1: "Low"}
+
+    def resolve_scenario_severity(db: Session, scenario: models.Scenario) -> str:
+        if isinstance(scenario.ad_context, dict) and scenario.ad_context.get("severity"):
+            raw = str(scenario.ad_context["severity"]).strip().lower()
+            if raw in SEVERITY_RANK:
+                return SEVERITY_LABEL[SEVERITY_RANK[raw]]
+        alerts = db.query(models.Alert).filter(models.Alert.scenario_id == scenario.id).all()
+        best_rank = 0
+        for al in alerts:
+            sev_val = getattr(al.severity, "value", al.severity)
+            rank = SEVERITY_RANK.get(str(sev_val or "").strip().lower(), 0)
+            if rank > best_rank:
+                best_rank = rank
+        return SEVERITY_LABEL.get(best_rank, "High")
+
+    def resolve_optional_user(request: Request, db: Session) -> Optional[models.User]:
+        auth_header = request.headers.get("Authorization") or ""
+        if not auth_header.startswith("Bearer "):
+            return None
+        token = auth_header.split(" ", 1)[1].strip()
+        if not token:
+            return None
+        try:
+            from jose import jwt as _jwt
+            algo = getattr(main_module, "ALGORITHM", "HS256")
+            payload = _jwt.decode(token, strong_secret, algorithms=[algo])
+            uname = payload.get("sub")
+            if uname:
+                return db.query(models.User).filter(models.User.username == uname).first()
+        except Exception:
+            return None
+        return None
+
+    def enrich_scenario_dict(db: Session, scenario: models.Scenario, user: Optional[models.User] = None) -> Dict[str, Any]:
+        sev = resolve_scenario_severity(db, scenario)
+        q_count = db.query(models.Question).filter(models.Question.scenario_id == scenario.id).count()
+        l_count = db.query(models.Log).filter(models.Log.scenario_id == scenario.id).count()
+        alert = db.query(models.Alert).filter(models.Alert.scenario_id == scenario.id).first()
+        alert_title = alert.title if alert else None
+
+        trials_count = 0
+        best_score = None
+        last_score = None
+        in_progress = False
+
+        if user is not None:
+            results = (
+                db.query(models.InvestigationResult)
+                .filter(
+                    models.InvestigationResult.user_id == user.id,
+                    models.InvestigationResult.scenario_id == scenario.id,
+                )
+                .order_by(models.InvestigationResult.id.asc())
+                .all()
+            )
+            trials_count = len(results)
+            if results:
+                scores = [int(r.score or 0) for r in results]
+                best_score = max(scores)
+                last_score = int(results[-1].score or 0)
+
+            active_attempts = (
+                db.query(models.QuestionAttempt)
+                .filter(
+                    models.QuestionAttempt.user_id == user.id,
+                    models.QuestionAttempt.scenario_id == scenario.id,
+                )
+                .all()
+            )
+            in_progress = any(
+                a.free_hint_used or a.paid_hint_used or (a.wrong_attempts or 0) > 0 or a.is_solved
+                for a in active_attempts
+            )
+
+        return {
+            "id": scenario.id,
+            "name": scenario.name,
+            "description": scenario.description,
+            "mitre_technique": scenario.mitre_technique,
+            "status": scenario.status,
+            "ad_context": scenario.ad_context,
+            "severity": sev,
+            "alert_title": alert_title,
+            "trials_count": trials_count,
+            "attempts_count": trials_count,
+            "best_score": best_score,
+            "last_score": last_score,
+            "in_progress": in_progress,
+            "question_count": q_count,
+            "log_count": l_count,
+        }
+
     router = APIRouter()
+
+    @router.get("/api/scenarios", response_model=List[schemas.ScenarioOut])
+    def list_scenarios_hardened(
+        request: Request,
+        db: Session = Depends(get_db),
+    ):
+        user = resolve_optional_user(request, db)
+        all_scenarios = db.query(models.Scenario).order_by(models.Scenario.id.asc()).all()
+        is_admin = user is not None and str(getattr(user, "role", "")).strip().lower() == "admin"
+        visible = [
+            s for s in all_scenarios
+            if is_admin or str(s.status or "").strip().lower() == "published"
+        ]
+        return [enrich_scenario_dict(db, s, user) for s in visible]
 
     @router.get("/api/scenarios/{scenario_id}", response_model=schemas.ScenarioOut)
     def get_scenario_hardened(
+        request: Request,
         scenario: models.Scenario = Depends(get_accessible_scenario),
+        db: Session = Depends(get_db),
     ):
-        return scenario
+        user = resolve_optional_user(request, db)
+        return enrich_scenario_dict(db, scenario, user)
+
+    @router.get("/api/scenarios/{scenario_id}/progress")
+    def get_scenario_progress_hardened(
+        scenario: models.Scenario = Depends(get_accessible_scenario),
+        current_user: models.User = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ):
+        questions = {
+            q.id: q
+            for q in db.query(models.Question).filter(models.Question.scenario_id == scenario.id).all()
+        }
+        attempts = (
+            db.query(models.QuestionAttempt)
+            .filter(
+                models.QuestionAttempt.user_id == current_user.id,
+                models.QuestionAttempt.scenario_id == scenario.id,
+            )
+            .all()
+        )
+        trials = (
+            db.query(models.InvestigationResult)
+            .filter(
+                models.InvestigationResult.user_id == current_user.id,
+                models.InvestigationResult.scenario_id == scenario.id,
+            )
+            .order_by(models.InvestigationResult.id.asc())
+            .all()
+        )
+
+        question_progress: Dict[int, Dict[str, Any]] = {}
+        for att in attempts:
+            q = questions.get(att.question_id)
+            if not q:
+                continue
+            free_text = (
+                getattr(q, "free_hint", None)
+                or getattr(q, "hint", None)
+                or "Filter logs by the alerted host or user account."
+            )
+            paid_text = (
+                getattr(q, "hint", None)
+                or getattr(q, "free_hint", None)
+                or "Inspect the correlated high-severity Event IDs around the alert timestamp."
+            )
+            question_progress[q.id] = {
+                "question_id": q.id,
+                "free_hint_used": bool(att.free_hint_used),
+                "paid_hint_used": bool(att.paid_hint_used),
+                "free_hint_text": free_text if att.free_hint_used else None,
+                "paid_hint_text": paid_text if att.paid_hint_used else None,
+                "wrong_attempts": int(att.wrong_attempts or 0),
+                "is_solved": bool(att.is_solved),
+                "verified_answer": q.correct_answer if att.is_solved else None,
+            }
+
+        scores = [int(t.score or 0) for t in trials]
+        return {
+            "scenario_id": scenario.id,
+            "trials_count": len(trials),
+            "best_score": max(scores) if scores else None,
+            "last_score": scores[-1] if scores else None,
+            "questions": question_progress,
+        }
+
+    @router.post("/api/scenarios/{scenario_id}/progress/reset")
+    def reset_scenario_progress_hardened(
+        scenario: models.Scenario = Depends(get_accessible_scenario),
+        current_user: models.User = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ):
+        db.query(models.QuestionAttempt).filter(
+            models.QuestionAttempt.user_id == current_user.id,
+            models.QuestionAttempt.scenario_id == scenario.id,
+        ).delete(synchronize_session=False)
+        db.commit()
+        return {"message": "In-progress session reset", "scenario_id": scenario.id}
+
+    @router.get("/api/profile/activity")
+    def get_user_profile_activity(
+        current_user: models.User = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ):
+        scenarios_by_id = {s.id: s for s in db.query(models.Scenario).all()}
+        results = (
+            db.query(models.InvestigationResult)
+            .filter(models.InvestigationResult.user_id == current_user.id)
+            .order_by(models.InvestigationResult.id.asc())
+            .all()
+        )
+        active_attempts = (
+            db.query(models.QuestionAttempt)
+            .filter(models.QuestionAttempt.user_id == current_user.id)
+            .all()
+        )
+
+        trial_counter_by_scenario: Dict[int, int] = {}
+        activity_feed: List[Dict[str, Any]] = []
+        for r in results:
+            trial_counter_by_scenario[r.scenario_id] = trial_counter_by_scenario.get(r.scenario_id, 0) + 1
+            sc = scenarios_by_id.get(r.scenario_id)
+            sev = resolve_scenario_severity(db, sc) if sc else "High"
+            pins = r.pinned_log_ids if isinstance(r.pinned_log_ids, list) else []
+            activity_feed.append(
+                {
+                    "id": r.id,
+                    "scenario_id": r.scenario_id,
+                    "scenario_name": sc.name if sc else f"Scenario #{r.scenario_id}",
+                    "mitre_technique": sc.mitre_technique if sc else "N/A",
+                    "severity": sev,
+                    "score": int(r.score or 0),
+                    "points_earned": int(r.points_earned or 0),
+                    "total_points": int(r.total_points or 100),
+                    "trial_number": trial_counter_by_scenario[r.scenario_id],
+                    "total_trials_for_scenario": 0,
+                    "pinned_logs_count": len(pins),
+                    "status": "Completed",
+                    "submitted_at": r.submitted_at.isoformat() if r.submitted_at else None,
+                }
+            )
+
+        for item in activity_feed:
+            item["total_trials_for_scenario"] = trial_counter_by_scenario.get(item["scenario_id"], 1)
+
+        activity_feed.reverse()
+
+        in_progress_sids = set()
+        hints_used_count = 0
+        wrong_guesses_count = 0
+        for att in active_attempts:
+            if att.free_hint_used:
+                hints_used_count += 1
+            if att.paid_hint_used:
+                hints_used_count += 1
+            wrong_guesses_count += int(att.wrong_attempts or 0)
+            if att.free_hint_used or att.paid_hint_used or (att.wrong_attempts or 0) > 0 or att.is_solved:
+                in_progress_sids.add(att.scenario_id)
+
+        in_progress_items: List[Dict[str, Any]] = []
+        for sid in sorted(in_progress_sids):
+            sc = scenarios_by_id.get(sid)
+            if not sc:
+                continue
+            sev = resolve_scenario_severity(db, sc)
+            sid_atts = [a for a in active_attempts if a.scenario_id == sid]
+            sid_wrong = sum(int(a.wrong_attempts or 0) for a in sid_atts)
+            sid_hints = sum(1 for a in sid_atts if a.free_hint_used or a.paid_hint_used)
+            solved_cnt = sum(1 for a in sid_atts if a.is_solved)
+            q_total = db.query(models.Question).filter(models.Question.scenario_id == sid).count()
+            in_progress_items.append(
+                {
+                    "scenario_id": sid,
+                    "scenario_name": sc.name,
+                    "mitre_technique": sc.mitre_technique,
+                    "severity": sev,
+                    "wrong_attempts": sid_wrong,
+                    "attempts_count": sid_wrong + solved_cnt,
+                    "hints_used": sid_hints,
+                    "solved_questions": solved_cnt,
+                    "total_questions": q_total,
+                    "trials_completed": trial_counter_by_scenario.get(sid, 0),
+                    "status": "In Progress",
+                }
+            )
+
+        scores = [int(r.score or 0) for r in results]
+        completed_attempts_count = sum(int(r.trials_count or 1) for r in results)
+        total_all_attempts = completed_attempts_count + wrong_guesses_count + sum(1 for a in active_attempts if a.is_solved)
+        return {
+            "user_id": current_user.id,
+            "username": current_user.username,
+            "role": current_user.role,
+            "total_attempts": total_all_attempts,
+            "total_trials": len(results),
+            "scenarios_completed": len(trial_counter_by_scenario),
+            "scenarios_in_progress": len(in_progress_items),
+            "average_score": int(round(sum(scores) / len(scores))) if scores else 0,
+            "best_score": max(scores) if scores else 0,
+            "active_hints_used": hints_used_count,
+            "active_wrong_guesses": wrong_guesses_count,
+            "in_progress": in_progress_items,
+            "history": activity_feed,
+        }
 
     @router.get("/api/scenarios/{scenario_id}/alerts", response_model=List[schemas.AlertOut])
     def get_scenario_alerts_hardened(
@@ -561,6 +855,43 @@ def apply_hardened_routes(app: Any, main_module: Any) -> None:
 
         score_pct = int(round((points_earned / total_points) * 100)) if total_points > 0 else 0
 
+        existing_trials = (
+            db.query(models.InvestigationResult)
+            .filter(
+                models.InvestigationResult.user_id == current_user.id,
+                models.InvestigationResult.scenario_id == scenario.id,
+            )
+            .count()
+        )
+        current_trial_number = existing_trials + 1
+
+        hints_used = [
+            q.id for q in questions
+            if attempts_by_qid.get(q.id) and attempts_by_qid[q.id].paid_hint_used
+        ]
+        free_hints_used = [
+            q.id for q in questions
+            if attempts_by_qid.get(q.id) and attempts_by_qid[q.id].free_hint_used
+        ]
+        free_hint_id = submission.get("free_hint_id") or (free_hints_used[0] if free_hints_used else None)
+        user_guesses = submission.get("user_guesses") or {}
+        # Ensure user_guesses records all final answers so inspect guesses is never empty
+        for q in questions:
+            user_ans = answer_map.get(q.id, "").strip()
+            if user_ans:
+                q_key = str(q.id)
+                q_guesses = user_guesses.get(q_key) or user_guesses.get(q.id) or []
+                if not isinstance(q_guesses, list):
+                    q_guesses = [str(q_guesses)]
+                if not q_guesses or q_guesses[-1] != user_ans:
+                    q_guesses.append(user_ans)
+                user_guesses[q_key] = q_guesses
+
+        guesses_attempt_count = sum(len(v) for v in user_guesses.values()) if user_guesses else 0
+        server_wrong_count = sum(int(a.wrong_attempts or 0) for a in attempts_by_qid.values())
+        client_trials = int(submission.get("trials_count") or 1)
+        total_session_attempts = max(current_trial_number, guesses_attempt_count, server_wrong_count + 1, client_trials)
+
         inv_result = models.InvestigationResult(
             user_id=current_user.id,
             scenario_id=scenario.id,
@@ -568,8 +899,21 @@ def apply_hardened_routes(app: Any, main_module: Any) -> None:
             points_earned=points_earned,
             total_points=total_points,
             pinned_log_ids=pinned_log_ids,
+            hints_used=hints_used,
+            free_hint_id=free_hint_id,
+            free_hints_used=free_hints_used,
+            trials_count=total_session_attempts,
+            user_guesses=user_guesses,
+            submitted_at=datetime.utcnow(),
         )
         db.add(inv_result)
+
+        # Clear in-progress session attempts for this scenario so a subsequent investigation starts fresh
+        db.query(models.QuestionAttempt).filter(
+            models.QuestionAttempt.user_id == current_user.id,
+            models.QuestionAttempt.scenario_id == scenario.id,
+        ).delete()
+
         db.commit()
 
         return {
@@ -581,6 +925,9 @@ def apply_hardened_routes(app: Any, main_module: Any) -> None:
             "pinned_log_ids": pinned_log_ids,
             "evidence_verified": evidence_supported,
             "matched_key_evidence_count": len(matched_evidence_pins),
+            "trial_number": current_trial_number,
+            "trials_count": total_session_attempts,
+            "attempts_count": total_session_attempts,
         }
 
     @router.post("/api/admin/scenarios/{scenario_id}/upload-logs")

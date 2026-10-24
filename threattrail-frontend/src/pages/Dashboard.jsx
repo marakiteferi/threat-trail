@@ -50,7 +50,7 @@ function AttackIcon({ mitre, size = 18 }) {
 }
 
 function ScenarioCard({ scenario, index, isAuthenticated }) {
-  const sev = scenario.alert_severity || 'High'
+  const sev = scenario.severity || scenario.alert_severity || 'High'
   const meta = SEVERITY_META[sev] || SEVERITY_META.High
   const navigate = useNavigate()
 
@@ -76,6 +76,16 @@ function ScenarioCard({ scenario, index, isAuthenticated }) {
           <AttackIcon mitre={scenario.mitre_technique} size={20} />
         </div>
         <div className="db-card-badges">
+          {scenario.in_progress && (
+            <span className="db-mitre-badge" style={{ background: 'rgba(245, 158, 11, 0.15)', color: '#f59e0b', border: '1px solid rgba(245, 158, 11, 0.4)' }}>
+              In Progress
+            </span>
+          )}
+          {scenario.trials_count > 0 && (
+            <span className="db-mitre-badge" style={{ background: 'rgba(59, 130, 246, 0.15)', color: '#60a5fa', border: '1px solid rgba(59, 130, 246, 0.4)' }}>
+              {scenario.trials_count} {scenario.trials_count === 1 ? 'Trial' : 'Trials'} ({scenario.best_score ?? 0}%)
+            </span>
+          )}
           <span className="db-sev-badge" style={{ background: meta.bg, border: `1px solid ${meta.border}`, color: meta.color }}>
             <span className="db-sev-dot" style={{ background: meta.color }} />
             {sev}
@@ -111,7 +121,7 @@ function ScenarioCard({ scenario, index, isAuthenticated }) {
 
         {isAuthenticated ? (
           <Link to={`/investigate/${scenario.id}`} className="db-start-btn">
-            <span>Investigate</span>
+            <span>{scenario.in_progress ? 'Resume' : scenario.trials_count > 0 ? 'Retake' : 'Investigate'}</span>
             <ArrowRight size={14} className="db-btn-arrow" />
           </Link>
         ) : (
@@ -232,8 +242,8 @@ export default function Dashboard() {
       .finally(() => setLoading(false))
   }, [])
 
-  const critCount  = scenarios.filter(s => s.alert_severity === 'Critical').length
-  const highCount  = scenarios.filter(s => s.alert_severity === 'High').length
+  const critCount  = scenarios.filter(s => String(s.severity || s.alert_severity || '').toLowerCase() === 'critical').length
+  const highCount  = scenarios.filter(s => String(s.severity || s.alert_severity || '').toLowerCase() === 'high').length
   const totalCount = scenarios.length
 
   if (loading) return (

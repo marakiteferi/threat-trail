@@ -14,7 +14,8 @@ import bcrypt
 from jose import jwt, JWTError
 
 from database import engine, get_db, Base
-from models import User, Scenario, Alert, Log, Question, InvestigationResult, SeverityLevel
+import models
+from models import User, Scenario, Alert, Log, Question, InvestigationResult, QuestionAttempt, SeverityLevel
 from schemas import (
     ScenarioOut, AlertOut, LogOut, QuestionOut, QuestionAdminOut,
     SubmissionRequest, SubmissionResponse, QuestionResult,
@@ -330,12 +331,43 @@ def get_profile_stats(
 ):
     """Return current user's investigation stats for their profile page."""
     results = db.query(InvestigationResult).filter(InvestigationResult.user_id == current_user.id).all()
+    active_attempts = db.query(models.QuestionAttempt).filter(models.QuestionAttempt.user_id == current_user.id).all()
+
     total_investigations = len(results)
     total_points = sum(r.points_earned for r in results)
     avg_score = round(sum(r.score for r in results) / total_investigations) if total_investigations else 0
-    hints_used = sum(len(r.hints_used or []) for r in results)
+    active_hints = sum(1 for a in active_attempts if a.free_hint_used or a.paid_hint_used)
+    hints_used = sum(len(r.hints_used or []) for r in results) + active_hints
     scenarios_completed = len(set(r.scenario_id for r in results))
+
+    completed_attempts = sum(r.trials_count or 1 for r in results)
+    active_wrong_attempts = sum(int(a.wrong_attempts or 0) for a in active_attempts)
+    active_solved_attempts = sum(1 for a in active_attempts if a.is_solved)
+    total_attempts = completed_attempts + active_wrong_attempts + active_solved_attempts
+    total_trials = max(total_investigations, completed_attempts)
     
+    # Compute rank among non-admin trainees so Profile rank matches Leaderboard rank
+    non_admin_users = db.query(User).filter(User.role != "admin").all()
+    all_results = db.query(InvestigationResult).all()
+    user_results: dict[int, list[InvestigationResult]] = {}
+    for r in all_results:
+        user_results.setdefault(r.user_id, []).append(r)
+
+    standings = []
+    for u in non_admin_users:
+        u_res = user_results.get(u.id, [])
+        u_pts = sum(r.points_earned for r in u_res)
+        u_scs = len(set(r.scenario_id for r in u_res))
+        u_avg = round(sum(r.score for r in u_res) / len(u_res)) if u_res else 0
+        standings.append({"user_id": u.id, "points": u_pts, "scenarios": u_scs, "avg": u_avg})
+
+    standings.sort(key=lambda x: (x["points"], x["scenarios"], x["avg"]), reverse=True)
+    user_rank = None
+    for idx, s in enumerate(standings, start=1):
+        if s["user_id"] == current_user.id:
+            user_rank = idx
+            break
+
     recent = sorted(results, key=lambda r: r.submitted_at or datetime.min, reverse=True)[:5]
     recent_out = []
     for r in recent:
@@ -350,10 +382,13 @@ def get_profile_stats(
     
     return {
         "total_investigations": total_investigations,
+        "total_trials": total_trials,
+        "total_attempts": total_attempts,
         "total_points": total_points,
         "average_score": avg_score,
         "hints_used": hints_used,
         "scenarios_completed": scenarios_completed,
+        "rank": user_rank,
         "recent_activity": recent_out,
     }
 
@@ -839,6 +874,63 @@ def get_admin_submissions(
         .all()
     )
     out = []
+
+    # Include active in-progress analyst sessions so admin inspect guesses monitors ongoing investigations
+    active_attempts = db.query(models.QuestionAttempt).all()
+    attempts_by_user_scenario: dict[tuple[int, int], list[models.QuestionAttempt]] = {}
+    for att in active_attempts:
+        attempts_by_user_scenario.setdefault((att.user_id, att.scenario_id), []).append(att)
+
+    for (uid, sid), att_list in attempts_by_user_scenario.items():
+        total_wrong = sum(int(a.wrong_attempts or 0) for a in att_list)
+        total_solved = sum(1 for a in att_list if a.is_solved)
+        hints_paid = [a.question_id for a in att_list if a.paid_hint_used]
+        hints_free = [a.question_id for a in att_list if a.free_hint_used]
+
+        if total_wrong == 0 and total_solved == 0 and not hints_paid and not hints_free:
+            continue
+
+        u = db.query(User).filter(User.id == uid).first()
+        sc = db.query(Scenario).filter(Scenario.id == sid).first()
+        if not u or not sc:
+            continue
+
+        guesses_map: dict[str, list[str]] = {}
+        for a in att_list:
+            q_label = str(a.question_id)
+            steps = []
+            if a.wrong_attempts > 0:
+                for w_idx in range(a.wrong_attempts):
+                    steps.append(f"Incorrect attempt #{w_idx + 1}")
+            if a.is_solved:
+                steps.append("Verified correct finding")
+            if not steps:
+                steps.append("In progress")
+            guesses_map[q_label] = steps
+
+        out.append(
+            SubmissionAdminOut(
+                id=-(sid * 100000 + uid),
+                user_id=uid,
+                username=u.username,
+                user_role=u.role,
+                scenario_id=sid,
+                scenario_name=sc.name,
+                mitre_technique=sc.mitre_technique or "N/A",
+                score=0,
+                points_earned=0,
+                total_points=100,
+                hints_used=hints_paid,
+                free_hint_id=hints_free[0] if hints_free else None,
+                free_hints_used=hints_free,
+                hint_penalty=len(hints_paid) * 15,
+                trials_count=max(1, total_wrong + total_solved),
+                user_guesses=guesses_map,
+                status="In Progress",
+                submitted_at=None,
+            )
+        )
+
     for s in submissions:
         user = s.user
         scenario = s.scenario
@@ -865,6 +957,7 @@ def get_admin_submissions(
                 hint_penalty=hint_penalty,
                 trials_count=s.trials_count or 1,
                 user_guesses=s.user_guesses or {},
+                status="Completed",
                 submitted_at=s.submitted_at.isoformat() if s.submitted_at else None,
             )
         )
@@ -1019,7 +1112,7 @@ def admin_reset_user_password(
 
 @app.get("/api/leaderboard", response_model=list[LeaderboardUserOut])
 def get_leaderboard(db: Session = Depends(get_db)):
-    users = db.query(User).all()
+    users = db.query(User).filter(User.role != "admin").all()
     results = db.query(InvestigationResult).all()
 
     user_results = {}
